@@ -1,7 +1,6 @@
 """
-XAUUSD Forensic Walk-Backtester (Auto-Fetch Enabled)
+XAUUSD Forensic Walk-Backtester (Robust Auto-Fetch)
 Skrip untuk menguji akurasi Deep Forensic Gating pada data historis.
-Jika file CSV lokal kosong/tidak ada, data akan ditarik secara otomatis dari TwelveData API.
 """
 
 import os
@@ -23,9 +22,13 @@ def fetch_historical_from_twelvedata(csv_path: str = "data/xauusd_h1.csv"):
     resp.raise_for_status()
     data = resp.json()
     
+    # Cek apakah API mengembalikan error (misal: limit habis atau salah parameter)
+    if "status" in data and data["status"] == "error":
+        raise ValueError(f"TwelveData API Error: {data.get('message', 'Unknown error')}")
+        
     values = data.get("values", [])
     if not values:
-        raise ValueError(f"Gagal mengambil data dari API: {data}")
+        raise ValueError(f"Format respons API tidak valid atau kosong: {data}")
         
     df = pd.DataFrame(values)
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
@@ -33,9 +36,12 @@ def fetch_historical_from_twelvedata(csv_path: str = "data/xauusd_h1.csv"):
     print(f"Berhasil menyimpan {len(df)} baris data ke {csv_path}")
 
 def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
-    # Cek apakah file tidak ada atau ukurannya 0 (kosong)
-    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
-        print(f"File {csv_path} kosong atau tidak ditemukan.")
+    # Hapus file jika kosong agar ter-download ulang dengan benar
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) == 0:
+        os.remove(csv_path)
+
+    if not os.path.exists(csv_path):
+        print(f"File {csv_path} tidak ditemukan.")
         try:
             fetch_historical_from_twelvedata(csv_path)
         except Exception as e:
@@ -43,9 +49,18 @@ def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
             return
 
     print(f"Memuat data historis dari {csv_path}...")
-    df = pd.read_csv(csv_path)
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        print(f"Gagal memparsing CSV: {e}")
+        # Coba hapus file yang rusak dan unduh ulang sekali lagi
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+        fetch_historical_from_twelvedata(csv_path)
+        df = pd.read_csv(csv_path)
+
     if df.empty:
-        print("Error: File CSV terbaca kosong.")
+        print("Error: File CSV terbaca kosong setelah diunduh.")
         return
         
     df.columns = [c.strip().lower() for c in df.columns]
@@ -66,7 +81,6 @@ def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
     successful_trades = 0
     failed_trades = 0
 
-    # Simulasi walk-forward bar demi bar
     for i in range(50, total_bars - 5):
         subset = df.iloc[:i]
         last = subset.iloc[-1]
