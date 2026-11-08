@@ -1,11 +1,12 @@
 """
-XAUUSD Quantitative Institutional Signal Bot (Master Quant Grade - Precision >95%)
+XAUUSD Quantitative Institutional Signal Bot (Master Quant Grade - Precision Optimized)
 Single-File Consolidated Architecture (Full Production Grade)
 
 Core Features:
   - Multi-Timeframe Confluence (H1 Macro + M15 Microstructure Execution)
   - 21-Voter Ensemble with Regime-Adaptive Dynamic Weights
-  - Deep Forensic Gating (Liquidity Sweeps, Rejection Wicks >35%, Volume Ratio)
+  - Deep Forensic Gating (Liquidity Sweeps, Wick Rejections >40%, Volume Ratio >1.5x)
+  - Macro Trend Alignment (EMA 200 Filter) & Strict Threshold (>= 85%)
   - Volume Profile POC (Point of Control) Institutional Level Filter
   - SQLite Self-Auditing Performance Logger & Walk-Forward Audit DB
   - Dynamic ATR Volatility Lot Sizing & Chandelier Trailing Stop
@@ -263,7 +264,6 @@ def fetch_twelvedata(session: requests.Session, api_key: str, interval: str, siz
         if c in df.columns:
             df[c] = df[c].astype(float)
             
-    # ROBUST VOLUME PARSING (Aman terhadap KeyError volume)
     if "volume" in df.columns:
         df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
     else:
@@ -323,7 +323,7 @@ class DataFetcher:
 
 
 # ============================================================================
-# 6. MASTER FORENSIC & ENSEMBLE ENGINE (PRECISION >95%)
+# 6. MASTER FORENSIC & HIGH-PRECISION ENGINE (THRESHOLD >= 85%)
 # ============================================================================
 @dataclass
 class EnsembleResult:
@@ -338,7 +338,7 @@ class EnsembleResult:
     atr_value: float
 
 
-def evaluate_deep_forensics(df: pd.DataFrame) -> Tuple[float, str]:
+def evaluate_high_precision_forensics(df: pd.DataFrame) -> Tuple[float, str]:
     last = df.iloc[-1]
     prev = df.iloc[-21:-1]
     op, hi, lo, cl = last['open'], last['high'], last['low'], last['close']
@@ -358,10 +358,11 @@ def evaluate_deep_forensics(df: pd.DataFrame) -> Tuple[float, str]:
     vol_ma = df['volume'].iloc[-21:-1].mean()
     vol_ratio = last['volume'] / (vol_ma + 1e-10)
 
-    score = 40.0
-    if sweep != "NONE": score += 30.0
-    if wick_pct > 35.0: score += 15.0
-    if vol_ratio > 1.2: score += 15.0
+    # Sistem scoring diperketat sesuai hasil backtest high-precision
+    score = 30.0
+    if sweep != "NONE": score += 35.0
+    if wick_pct > 40.0: score += 20.0
+    if vol_ratio > 1.5: score += 15.0
 
     return min(score, 100.0), sweep
 
@@ -376,7 +377,7 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Con
     regime = "trending" if curr_adx > 20 else "ranging"
 
     poc = volume_profile_poc(df_h1)
-    forensic_score, sweep_type = evaluate_deep_forensics(df_h1)
+    forensic_score, sweep_type = evaluate_high_precision_forensics(df_h1)
 
     ema50, ema200 = ema(close, 50).iloc[-1], ema(close, 200).iloc[-1]
     rsi_v = rsi(close, 14).iloc[-1]
@@ -391,6 +392,13 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Con
     agreement = bull_score / total_checks
     weighted_score = (agreement - 0.5) * 2.0
 
+    # Filter Makro EMA 200
+    macro_aligned = True
+    if sweep_type == "BULLISH_SWEEP" and c_last < ema200:
+        macro_aligned = False
+    elif sweep_type == "BEARISH_SWEEP" and c_last > ema200:
+        macro_aligned = False
+
     m15_fast = ema(df_m15['close'], 9).iloc[-1]
     m15_slow = ema(df_m15['close'], 21).iloc[-1]
     m15_conf = "CONFIRMED_BULLISH" if m15_fast > m15_slow else "CONFIRMED_BEARISH"
@@ -398,16 +406,19 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Con
     action = "WAIT"
     notes = []
 
-    if forensic_score < 75.0:
-        notes.append(f"FORENSIC GATING FAILED: Konfluensi {forensic_score:.1f}% < 75% ambang batas presisi tinggi.")
-    elif agreement >= cfg.agreement_threshold and m15_conf == "CONFIRMED_BULLISH":
+    # Gating ketat standar High-Precision (Threshold >= 85%)
+    if forensic_score < 85.0:
+        notes.append(f"HIGH-PRECISION GATED: Konfluensi {forensic_score:.1f}% < 85% ambang batas minimum.")
+    elif not macro_aligned:
+        notes.append("MACRO FILTER REJECTED: Arah sweep bertentangan dengan tren EMA 200 H1.")
+    elif agreement >= cfg.agreement_threshold and m15_conf == "CONFIRMED_BULLISH" and sweep_type == "BULLISH_SWEEP":
         action = "BUY"
-        notes.append(f"HIGH PRECISION BUY: Forensic Confluence {forensic_score:.1f}%, POC Support & M15 Confirmed.")
-    elif agreement <= (1.0 - cfg.agreement_threshold) and m15_conf == "CONFIRMED_BEARISH":
+        notes.append(f"SNIPER BUY: Forensic Confluence {forensic_score:.1f}%, Macro & M15 Confirmed.")
+    elif agreement <= (1.0 - cfg.agreement_threshold) and m15_conf == "CONFIRMED_BEARISH" and sweep_type == "BEARISH_SWEEP":
         action = "SELL"
-        notes.append(f"HIGH PRECISION SELL: Forensic Confluence {forensic_score:.1f}%, POC Resistance & M15 Confirmed.")
+        notes.append(f"SNIPER SELL: Forensic Confluence {forensic_score:.1f}%, Macro & M15 Confirmed.")
     else:
-        notes.append("Konsensus ensembel dan struktur mikro belum selaras penuh.")
+        notes.append("Kondisi pasar belum memenuhi kriteria presisi tinggi absolut.")
 
     return EnsembleResult(
         action=action, weighted_score=round(weighted_score, 4), agreement_ratio=round(agreement, 4),
@@ -455,13 +466,13 @@ def send_telegram(cfg: Config, ensemble: EnsembleResult, spot: float, levels: Op
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     if ensemble.action == "WAIT":
-        msg = f"🟡 <b>XAUUSD QUANT v3.5 (PRECISION >95%): WAIT</b>\n⏰ <code>{now}</code>\n<b>Forensic Confluence:</b> {ensemble.forensic_confluence}%\n<b>Reason:</b> {ensemble.notes[0]}"
+        msg = f"🟡 <b>XAUUSD QUANT v3.5 (SNIPER MODE >=85%): WAIT</b>\n⏰ <code>{now}</code>\n<b>Forensic Confluence:</b> {ensemble.forensic_confluence}%\n<b>Reason:</b> {ensemble.notes[0]}"
     else:
         emoji = "🟢" if ensemble.action == "BUY" else "🔴"
-        msg = f"""{emoji} <b>XAUUSD QUANT v3.5 ({ensemble.action} - HIGH PRECISION)</b>
+        msg = f"""{emoji} <b>XAUUSD QUANT v3.5 ({ensemble.action} - SNIPER GRADE)</b>
 ⏰ <code>{now}</code>
 ───────────────────
-<b>Forensic Confluence:</b> <b>{ensemble.forensic_confluence}%</b> (&ge;75% PASSED)
+<b>Forensic Confluence:</b> <b>{ensemble.forensic_confluence}%</b> (&ge;85% PASSED)
 <b>Regime:</b> {ensemble.regime.upper()} | <b>POC:</b> ${ensemble.poc_level:.2f}
 <b>Agreement:</b> {ensemble.agreement_ratio*100:.0f}% | <b>Micro:</b> {ensemble.m15_confluence}
 
@@ -485,7 +496,7 @@ TS    : ${levels['trailing_stop']:.2f}</code>
 
 
 def main() -> int:
-    log_event(LOGGER, "bot_started", version="3.5.0-high-precision-95")
+    log_event(LOGGER, "bot_started", version="3.5.0-high-precision-85")
     cfg = Config()
     db = AuditDatabase()
     fetcher = DataFetcher(cfg)
