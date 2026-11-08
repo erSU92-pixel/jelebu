@@ -1,5 +1,5 @@
 """
-XAUUSD Forensic Walk-Backtester (High-Precision Optimized)
+XAUUSD Forensic Walk-Backtester (Robust File Check)
 Skrip pengujian dengan Ambang Batas 85% & Filter Tren Makro EMA 200.
 """
 
@@ -38,7 +38,9 @@ def fetch_historical_from_twelvedata(csv_path: str = "data/xauusd_h1.csv"):
     print(f"Berhasil menyimpan {len(df)} baris data ke {csv_path}")
 
 def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
+    # PERBAIKAN UTAMA: Hapus file jika tidak ada atau ukurannya 0 bytes
     if os.path.exists(csv_path) and os.path.getsize(csv_path) == 0:
+        print(f"File {csv_path} kosong (0 bytes), menghapus file...")
         os.remove(csv_path)
 
     if not os.path.exists(csv_path):
@@ -48,7 +50,16 @@ def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
             print(f"Error saat mendownload data otomatis: {e}")
             return
 
-    df = pd.read_csv(csv_path)
+    print(f"Memuat data historis dari {csv_path}...")
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception as e:
+        print(f"Gagal memparsing CSV: {e}, mencoba mengunduh ulang...")
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+        fetch_historical_from_twelvedata(csv_path)
+        df = pd.read_csv(csv_path)
+
     if df.empty:
         print("Error: File CSV terbaca kosong.")
         return
@@ -63,7 +74,6 @@ def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
             df[col] = df[col].astype(float)
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
 
-    # Hitung indikator pendukung makro (EMA 200)
     df['ema200'] = ema(df['close'], 200)
 
     total_bars = len(df)
@@ -98,20 +108,17 @@ def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
         vol_ma = subset['volume'].iloc[-21:-1].mean()
         vol_ratio = last['volume'] / (vol_ma + 1e-10)
 
-        # Sistem Scoring Diperketat
-        score = 30.0 # Base score diturunkan agar selektif
+        score = 30.0
         if sweep != "NONE": score += 35.0
-        if wick_pct > 40.0: score += 20.0  # Wick rejection lebih ketat (>40%)
-        if vol_ratio > 1.5: score += 15.0  # Lonjakan volume lebih tinggi (>1.5x)
+        if wick_pct > 40.0: score += 20.0
+        if vol_ratio > 1.5: score += 15.0
 
-        # Filter tambahan: Selaras dengan Tren Makro EMA 200
         macro_aligned = True
         if sweep == "BULLISH_SWEEP" and cl < last['ema200']:
             macro_aligned = False
         elif sweep == "BEARISH_SWEEP" and cl > last['ema200']:
             macro_aligned = False
 
-        # Gate Presisi Tinggi: Skor >= 85% DAN Selaras Tren Makro
         if score >= 85.0 and macro_aligned:
             triggered_signals += 1
             future_close = df.iloc[i + 5]['close']
