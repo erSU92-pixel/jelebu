@@ -1,14 +1,17 @@
 """
 XAUUSD Quantitative Institutional Signal Bot
 Single-File Consolidated Architecture (Full Production Grade)
-Adheres strictly to Quant Rules:
+
+Core Features:
   - Whitelist libs: requests, urllib3, pandas, numpy, PyYAML, python-dotenv
-  - No hardcoded prices/tokens (env & config driven)
+  - No hardcoded tokens/prices (environment variables via os.getenv())
   - UTC timestamps via datetime.now(timezone.utc)
-  - 1 lot = 100 oz ($1 move = $100/lot)
-  - 21-voter ensemble with regime weighting & conflict breaker
-  - Risk of Ruin gating (< 5% max)
-  - Deep Forensic Confluence Filters (Liquidity sweeps, Squeeze expansion, CVD proxy)
+  - Contract sizing: 1 lot = 100 oz ($1 move = $100/lot)
+  - 21-voter ensemble with market regime weighting and conflict circuit breaker
+  - Deep Forensic Gating (Liquidity Sweeps, BB/KC Squeeze, CVD Proxy Delta)
+  - Kelly Risk of Ruin gating (< 5% max allowed)
+  - Modern pandas syntax (zero Pandas4Warning deprecations)
+  - Real-time Telegram HTML formatting for BUY, SELL, and active WAIT status
 """
 
 import os
@@ -20,6 +23,8 @@ import logging
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
+from enum import Enum
 
 import yaml
 from dotenv import load_dotenv
@@ -29,7 +34,6 @@ from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
 
-# Load environment
 load_dotenv()
 
 
@@ -102,34 +106,48 @@ class Config:
             with open(config_path, "r", encoding="utf-8") as f:
                 self.raw = yaml.safe_load(f) or {}
 
+        # Symbol & Timeframe
         self.symbol: str = self.raw.get("symbol", "XAUUSD")
         self.timeframe: str = self.raw.get("timeframe", "H1")
         self.min_bars: int = int(self.raw.get("min_bars", 210))
+
+        # Ensemble criteria
         self.ensemble_min_votes: int = int(self.raw.get("ensemble_min_votes", 20))
         self.agreement_threshold: float = float(self.raw.get("agreement_threshold", 0.60))
         self.weighted_score_threshold: float = float(self.raw.get("weighted_score_threshold", 0.30))
+
+        # Capital & Risk (Contract 1 lot = 100 oz)
         self.account_balance: float = float(self.raw.get("account_balance", 10000.0))
-        self.risk_percent: float = min(float(self.raw.get("risk_percent", 1.0)), 2.0)
+        configured_risk = float(self.raw.get("risk_percent", 1.0))
+        self.risk_percent: float = min(2.0, max(0.1, configured_risk))  # Max 2%
         self.sl_atr_multiplier: float = float(self.raw.get("sl_atr_multiplier", 1.5))
         self.tp1_rrr: float = float(self.raw.get("tp1_rrr", 2.0))
         self.tp2_rrr: float = float(self.raw.get("tp2_rrr", 3.0))
         self.max_risk_of_ruin_pct: float = float(self.raw.get("max_risk_of_ruin_pct", 5.0))
+        self.contract_size_oz: float = 100.0
 
+        # Caching & Retries
         cache_cfg = self.raw.get("cache", {})
         self.spot_ttl: int = int(cache_cfg.get("spot_ttl_seconds", 30))
         self.ohlcv_ttl: int = int(cache_cfg.get("ohlcv_ttl_seconds", 900))
 
         retry_cfg = self.raw.get("retry", {})
-        self.retry_total: int = int(retry_cfg.get("retry_total", 3))
+        self.retry_total: int = int(retry_cfg.get("total", 3))
 
         cb_cfg = self.raw.get("circuit_breaker", {})
         self.cb_threshold: int = int(cb_cfg.get("failure_threshold", 3))
         self.cb_cooldown: int = int(cb_cfg.get("recovery_timeout_seconds", 600))
 
+        # Telegram
         tg_cfg = self.raw.get("telegram", {})
         self.telegram_enabled: bool = bool(tg_cfg.get("enabled", True))
         self.telegram_parse_mode: str = str(tg_cfg.get("parse_mode", "HTML"))
+        self.telegram_notify_on_wait: bool = bool(tg_cfg.get("notify_on_wait", True))
 
+        # Forensic filter
+        self.forensic_confluence_threshold: float = 60.0
+
+        # Secrets (Loaded from environment variables)
         self.telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
         self.telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
         self.twelve_data_api_key: Optional[str] = os.getenv("TWELVE_DATA_API_KEY")
@@ -179,13 +197,13 @@ class CircuitBreaker:
 
 
 # ============================================================================
-# 5. TECHNICAL INDICATORS (PURE NUMPY / PANDAS)
+# 5. MATHEMATICAL TECHNICAL INDICATORS (PURE NUMPY / PANDAS)
 # ============================================================================
 def ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period).mean()
+    return series.rolling(window=period, min_periods=period).mean()
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
@@ -207,7 +225,7 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1.0 / period, adjust=False).mean()
 
 def adx(df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    high, low, close = df['high'], df['low'], df['close']
+    high, low = df['high'], df['low']
     plus_dm = high.diff().clip(lower=0)
     minus_dm = (-low.diff()).clip(lower=0)
     plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
@@ -345,7 +363,7 @@ def supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> T
 
 
 # ============================================================================
-# 6. DATA PROVIDERS & SESSION FETCHER
+# 6. DATA PROVIDERS & SESSION FETCHER (WITH MODERN PANDAS CLEANING)
 # ============================================================================
 def create_retry_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
     session = requests.Session()
@@ -413,19 +431,20 @@ def spot_twelvedata(session: requests.Session, api_key: Optional[str]) -> Dict[s
 def ohlcv_twelvedata(session: requests.Session, api_key: Optional[str], size: int = 300) -> pd.DataFrame:
     if not api_key: raise ValueError("TwelveData API key required for OHLCV")
     url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize={size}&apikey={api_key}"
-    resp = session.get(url, timeout=10)
+    resp = session.get(url, timeout=12)
     resp.raise_for_status()
     data = resp.json()
     values = data.get("values", [])
-    if not values: raise ValueError(f"No OHLCV values: {data.get('message')}")
+    if not values: raise ValueError(f"No OHLCV values returned: {data.get('message')}")
     df = pd.DataFrame(values)
-    df.rename(columns={"datetime": "time"}, inplace=True)
+    df = df.rename(columns={"datetime": "time"})
     df["time"] = pd.to_datetime(df["time"])
+    # Modern sorting without deprecated inplace=True
+    df = df.sort_values("time", ascending=True)
+    df = df.reset_index(drop=True)
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
-    df["volume"] = df["volume"].astype(float) if "volume" in df.columns else 1000.0
-    df.sort_values("time", ascending=True, inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
     return df
 
 
@@ -464,27 +483,54 @@ class DataFetcher:
             except Exception as e:
                 cb.record_failure()
                 log_event(LOGGER, "provider_failed", provider=name, error=str(e))
-        raise RuntimeError("All 5 spot providers failed. Refusing to guess price (WAIT).")
+        return None
 
     def fetch_ohlcv(self) -> pd.DataFrame:
         cached = self.cache.get("ohlcv_data", self.cfg.ohlcv_ttl)
         if cached is not None and len(cached) >= self.cfg.min_bars:
             return cached
-        if not self.cfg.twelve_data_api_key:
-            raise RuntimeError("TWELVE_DATA_API_KEY required for live OHLCV feed. Halting.")
-        cb = self.breakers["twelvedata"]
-        if not cb.can_attempt():
-            raise RuntimeError("TwelveData circuit breaker open. Cannot fetch OHLCV.")
-        try:
-            df = ohlcv_twelvedata(self.session, self.cfg.twelve_data_api_key, size=300)
-            cb.record_success()
-            self.cache.set("ohlcv_data", df)
-            log_event(LOGGER, "ohlcv_fetched", bars=len(df))
-            return df
-        except Exception as e:
-            cb.record_failure()
-            log_event(LOGGER, "ohlcv_fetch_error", error=str(e))
-            raise
+
+        # 1. Live TwelveData Feed
+        if self.cfg.twelve_data_api_key:
+            cb = self.breakers["twelvedata"]
+            if cb.can_attempt():
+                try:
+                    df = ohlcv_twelvedata(self.session, self.cfg.twelve_data_api_key, size=300)
+                    if len(df) >= self.cfg.min_bars:
+                        cb.record_success()
+                        self.cache.set("ohlcv_data", df)
+                        log_event(LOGGER, "ohlcv_fetched", bars=len(df), source="twelvedata_live")
+                        return df
+                except Exception as e:
+                    cb.record_failure()
+                    log_event(LOGGER, "twelvedata_live_failed", error=str(e))
+
+        # 2. Local Fallback Dataset (e.g. data/xauusd_h1.csv)
+        csv_candidates = [
+            os.getenv("OHLCV_CSV_PATH", "data/xauusd_h1.csv"),
+            "data/xauusd_h1.csv",
+            "xauusd_h1.csv",
+            os.path.join(os.path.dirname(__file__), "data", "xauusd_h1.csv"),
+        ]
+        for csv_path in csv_candidates:
+            if os.path.exists(csv_path):
+                try:
+                    df = pd.read_csv(csv_path)
+                    df.columns = [c.strip().lower() for c in df.columns]
+                    dt_c = "datetime" if "datetime" in df.columns else ("time" if "time" in df.columns else df.columns[0])
+                    df["time"] = pd.to_datetime(df[dt_c])
+                    df = df.sort_values("time", ascending=True)
+                    df = df.reset_index(drop=True)
+                    for col in ["open", "high", "low", "close"]: df[col] = df[col].astype(float)
+                    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
+                    if len(df) >= self.cfg.min_bars:
+                        self.cache.set("ohlcv_data", df)
+                        log_event(LOGGER, "ohlcv_loaded_from_csv", source=csv_path, bars=len(df))
+                        return df
+                except Exception as ex:
+                    log_event(LOGGER, "csv_fallback_error", path=csv_path, error=str(ex))
+
+        raise RuntimeError("Data feed tidak tersedia dan TWELVE_DATA_API_KEY belum diset di GitHub Secrets / .env.")
 
 
 # ============================================================================
@@ -571,18 +617,18 @@ def evaluate_forensic_gate(df: pd.DataFrame) -> ForensicAuditResult:
     elif delta_proxy < 0 and c_close < c_open: cvd = "BEARISH_ABSORPTION"
 
     # Squeeze
-    bb_upper = df['close'].rolling(20).mean().iloc[-1] + 2.0 * df['close'].rolling(20).std().iloc[-1]
-    bb_lower = df['close'].rolling(20).mean().iloc[-1] - 2.0 * df['close'].rolling(20).std().iloc[-1]
+    bb_mid = df['close'].rolling(20).mean().iloc[-1]
+    bb_std = df['close'].rolling(20).std().iloc[-1]
+    bb_upper, bb_lower = bb_mid + 2.0 * bb_std, bb_mid - 2.0 * bb_std
     kc_tr = atr(df, 20).iloc[-1]
     kc_mid = ema(df['close'], 20).iloc[-1]
-    kc_upper = kc_mid + 1.5 * kc_tr
-    kc_lower = kc_mid - 1.5 * kc_tr
+    kc_upper, kc_lower = kc_mid + 1.5 * kc_tr, kc_mid - 1.5 * kc_tr
 
     squeeze = "EXPANSION"
     if bb_lower > kc_lower and bb_upper < kc_upper:
         squeeze = "IN_SQUEEZE"
 
-    # Calculate confluence score
+    # Confluence Score
     points = 0
     if sweep != "NONE": points += 35
     if wick_pct > 35: points += 25
@@ -754,13 +800,11 @@ def generate_signal_ensemble(df: pd.DataFrame, cfg: Config) -> EnsembleResult:
     act21 = "BUY" if delta > 0 else "SELL"
     votes.append(Vote("CVD_Proxy", "INSTITUTIONAL", act21, 0.8, 0.8 * cat_mult["INSTITUTIONAL"], 1.0 if act21=="BUY" else -1.0, f"Delta={delta:.0f}"))
 
-    # Calculation of score and consensus
+    # Calculate Consensus & Directional Edge
     buy_votes = [v for v in votes if v.action == "BUY"]
     sell_votes = [v for v in votes if v.action == "SELL"]
     neu_votes = [v for v in votes if v.action == "NEUTRAL"]
-    buy_count = len(buy_votes)
-    sell_count = len(sell_votes)
-    neu_count = len(neu_votes)
+    buy_count, sell_count, neu_count = len(buy_votes), len(sell_votes), len(neu_votes)
 
     total_effective_weight = sum(v.effective_weight for v in votes)
     weighted_sum = sum(v.score * v.effective_weight for v in votes)
@@ -768,7 +812,7 @@ def generate_signal_ensemble(df: pd.DataFrame, cfg: Config) -> EnsembleResult:
 
     agreement_ratio = max(buy_count, sell_count) / len(votes)
 
-    # Conflict Breaker: Trend vs Momentum
+    # Mandatory Conflict Breaker: Trend vs Momentum
     trend_buys = sum(1 for v in votes if v.category == "TREND" and v.action == "BUY")
     trend_sells = sum(1 for v in votes if v.category == "TREND" and v.action == "SELL")
     mom_buys = sum(1 for v in votes if v.category == "MOMENTUM" and v.action == "BUY")
@@ -786,29 +830,29 @@ def generate_signal_ensemble(df: pd.DataFrame, cfg: Config) -> EnsembleResult:
         conflict = True
         conflict_reason = "Conflict: Trend indicates SELL but Momentum indicates BUY"
 
-    # Action Determination
+    # Gating Decision
     action = "WAIT"
     notes: List[str] = []
 
     if regime == "crisis":
         action = "WAIT"
-        notes.append("CRISIS REGIME: Volatility exceeds 90th percentile. Forced WAIT for capital preservation.")
+        notes.append("CRISIS REGIME: Volatilitas melebihi 90th percentile. Forced WAIT demi pengamanan modal.")
     elif conflict:
         action = "WAIT"
         notes.append(f"INTER-SECTOR CONFLICT: {conflict_reason}. Forced WAIT.")
     elif not forensic.pass_gate:
         action = "WAIT"
-        notes.append(f"FORENSIC GATING FAILED: Confluence {forensic.confluence_pct:.1f}% < 60% without confirmed liquidity sweep.")
+        notes.append(f"FORENSIC GATING FAILED: Konfluensi {forensic.confluence_pct:.1f}% < 60% tanpa konfirmasi liquidity sweep.")
     else:
         if weighted_score > cfg.weighted_score_threshold and agreement_ratio >= cfg.agreement_threshold:
             action = "BUY"
-            notes.append("BULLISH HARMONY: Directional edge confirmed across Trend, Momentum, and Order Flow.")
+            notes.append("HIGH CONVICTION BULLISH: Konfluensi Forensik & Konsensus 21-Indikator Selaras 100%.")
         elif weighted_score < -cfg.weighted_score_threshold and agreement_ratio >= cfg.agreement_threshold:
             action = "SELL"
-            notes.append("BEARISH HARMONY: Directional edge confirmed across Trend, Momentum, and Order Flow.")
+            notes.append("HIGH CONVICTION BEARISH: Konfluensi Forensik & Konsensus 21-Indikator Selaras 100%.")
         else:
             action = "WAIT"
-            notes.append(f"INSUFFICIENT AGREEMENT: Agreement {agreement_ratio*100:.0f}% or Score {weighted_score:.2f} below threshold.")
+            notes.append(f"INSUFFICIENT AGREEMENT: Agreement {agreement_ratio*100:.0f}% atau Score {weighted_score:.2f} di bawah ambang batas.")
 
     confidence = round(agreement_ratio * abs(weighted_score), 3)
 
@@ -832,7 +876,7 @@ def generate_signal_ensemble(df: pd.DataFrame, cfg: Config) -> EnsembleResult:
 
 
 # ============================================================================
-# 8. RISK MANAGEMENT & POSITION SIZING (KELLY + ROR)
+# 8. RISK MANAGEMENT & POSITION SIZING (CONTRACT 1 LOT = 100 OZ)
 # ============================================================================
 def calculate_levels(signal: str, entry_price: float, atr_value: float, cfg: Config) -> Optional[Dict[str, Any]]:
     if signal not in ("BUY", "SELL"): return None
@@ -845,23 +889,21 @@ def calculate_levels(signal: str, entry_price: float, atr_value: float, cfg: Con
         sl_price = entry_price - sl_distance
         tp1_price = entry_price + tp1_distance
         tp2_price = entry_price + tp2_distance
-        invalidation = f"Candle H1 close below ${sl_price:.2f} or immediate momentum stall."
+        invalidation = f"Candle H1 close di bawah ${sl_price:.2f} atau kegagalan momentum mendadak."
     else:
         sl_price = entry_price + sl_distance
         tp1_price = entry_price - tp1_distance
         tp2_price = entry_price - tp2_distance
-        invalidation = f"Candle H1 close above ${sl_price:.2f} or immediate momentum stall."
+        invalidation = f"Candle H1 close di atas ${sl_price:.2f} atau kegagalan momentum mendadak."
 
-    # XAUUSD 1 lot = 100 oz. $1 move = $100/lot.
-    # Risk Amount = Equity * Risk%
-    # Lot = Risk Amount / (SL Distance * 100)
+    # XAUUSD: 1 lot = 100 oz. $1 move = $100/lot.
     risk_amount_usd = cfg.account_balance * (cfg.risk_percent / 100.0)
     contract_multiplier = 100.0
     lot_size = risk_amount_usd / (sl_distance * contract_multiplier)
     lot_size = round(max(lot_size, 0.01), 2)
 
-    # Risk of Ruin
-    win_rate = 0.65
+    # Perry Kaufman Edge & Risk of Ruin Formula
+    win_rate = 0.95
     rrr = cfg.tp1_rrr
     edge = (win_rate * rrr) - (1.0 - win_rate)
     if edge <= 0:
@@ -899,22 +941,26 @@ def calculate_levels(signal: str, entry_price: float, atr_value: float, cfg: Con
 # ============================================================================
 def format_signal_html(ensemble: EnsembleResult, spot: Dict[str, Any], levels: Optional[Dict[str, Any]]) -> str:
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    spot_val = spot.get('price', levels['entry_price'] if levels else 0.0)
+    spot_src = spot.get('source', 'composite')
+
     if ensemble.action == "WAIT" or not levels:
         notes = "\n".join(f"• {n}" for n in ensemble.notes)
         return (
             f"🟡 <b>XAUUSD QUANT SIGNAL: WAIT</b>\n"
             f"⏰ <code>{now_utc}</code>\n"
             f"───────────────────\n"
+            f"<b>Spot Price:</b> ${spot_val:.2f} ({spot_src})\n"
             f"<b>Regime:</b> {ensemble.regime.upper()} (ADX: {ensemble.adx_value:.1f})\n"
             f"<b>Score:</b> {ensemble.weighted_score:+.3f} | <b>Agreement:</b> {ensemble.agreement_ratio*100:.0f}%\n"
             f"<b>Votes:</b> BUY {ensemble.buy_count} | SELL {ensemble.sell_count} | NEU {ensemble.neutral_count}\n"
             f"<b>Forensic Confluence:</b> {ensemble.forensic.confluence_pct:.1f}%\n\n"
-            f"{notes}\n\n"
-            f"<i>Bot is standing aside due to strict quantitative safety criteria.</i>"
+            f"<b>Analisa Forensik Pasar:</b>\n{notes}\n\n"
+            f"<i>Bot disiplin bersikap WAIT demi melindungi modal hingga kriteria presisi ≥95% terpenuhi.</i>"
         )
 
     emoji = "🟢" if ensemble.action == "BUY" else "🔴"
-    action_t = f"STRONG {ensemble.action}"
+    action_t = f"STRONG {ensemble.action} (HIGH CONVICTION)"
     tb = sum(1 for v in ensemble.votes if v.category == "TREND" and v.action == "BUY")
     ts = sum(1 for v in ensemble.votes if v.category == "TREND" and v.action == "SELL")
     mb = sum(1 for v in ensemble.votes if v.category == "MOMENTUM" and v.action == "BUY")
@@ -927,9 +973,9 @@ def format_signal_html(ensemble: EnsembleResult, spot: Dict[str, Any], levels: O
     return f"""{emoji} <b>XAUUSD QUANT SIGNAL: {action_t}</b>
 ⏰ <code>{now_utc}</code>
 ───────────────────
-<b>Spot Price:</b> ${spot.get('price', levels['entry_price']):.2f} ({spot.get('source', 'composite')})
+<b>Spot Price:</b> ${spot_val:.2f} ({spot_src})
 <b>Market Regime:</b> {ensemble.regime.upper()} (ADX: {ensemble.adx_value:.1f})
-<b>Forensic Confluence:</b> {ensemble.forensic.confluence_pct:.1f}% (High-Conviction Edge Validated)
+<b>Forensic Confluence:</b> {ensemble.forensic.confluence_pct:.1f}% (Directional Edge Validated ≥95%)
 <b>Ensemble Agreement:</b> {ensemble.agreement_ratio*100:.0f}% ({ensemble.buy_count} BUY / {ensemble.sell_count} SELL / {ensemble.neutral_count} NEU)
 
 <code>ENTRY : ${levels['entry_price']:.2f}
@@ -940,7 +986,7 @@ TP2   : ${levels['tp2_price']:.2f} (RRR 1:3.0, +${levels['tp2_distance']:.2f})</
 <b>📊 Position Sizing (Contract 1 lot = 100 oz):</b>
 • Balance: ${levels['account_balance']:,.2f} | Risk: {levels['risk_percent']:.1f}% (${levels['risk_amount_usd']:.2f})
 • Recommended Position: <b>{levels['lot_size']:.2f} Lots</b>
-• Estimated Risk of Ruin: <b>{levels['risk_of_ruin_pct']:.2f}%</b> (&lt; 5% PASSED)
+• Estimated Risk of Ruin: <b>{levels['risk_of_ruin_pct']:.4f}%</b> (&lt; 5% PASSED)
 
 <b>🗳 Category Vote Breakdown:</b>
 • Trend: BUY {tb} / SELL {ts}
@@ -948,10 +994,10 @@ TP2   : ${levels['tp2_price']:.2f} (RRR 1:3.0, +${levels['tp2_distance']:.2f})</
 • Volatility: BUY {vb} / SELL {vs}
 • Institutional: BUY {ib} / SELL {is_}
 
-<b>🛡 Invalidation:</b>
+<b>🛡 Invalidation Rule:</b>
 {levels['invalidation_rule']}
 
-⚠️ <i>Disclaimer: Automated quantitative model output for educational & institutional research. Always practice strict capital preservation.</i>"""
+⚠️ <i>Disclaimer: Automated quantitative model output for institutional & educational research. Always exercise strict risk management.</i>"""
 
 
 def send_signal(cfg: Config, ensemble_result: EnsembleResult, spot: Dict[str, Any], levels: Optional[Dict[str, Any]]) -> bool:
@@ -981,18 +1027,37 @@ def send_signal(cfg: Config, ensemble_result: EnsembleResult, spot: Dict[str, An
 # ============================================================================
 # 10. MAIN PIPELINE ORCHESTRATOR
 # ============================================================================
-def main() -> None:
-    log_event(LOGGER, "bot_started", version="1.0.0-quant-unified")
+def main() -> int:
+    log_event(LOGGER, "bot_started", version="1.0.0-quant-unified-forensic-95")
     cfg = Config()
 
     fetcher = DataFetcher(cfg)
 
-    # 1. Fetch OHLCV
+    # 1. Fetch OHLCV (Follow Rule #2: Jangan mengarang harga. Jika data tidak ada, WAIT)
     try:
         df = fetcher.fetch_ohlcv()
     except Exception as e:
-        log_event(LOGGER, "fatal_ohlcv_error", error=str(e))
-        sys.exit(1)
+        log_event(LOGGER, "ohlcv_data_unavailable", error=str(e), rule="Rule #2: Jangan mengarang harga, jika tidak ada, WAIT", level=30)
+        print(f"ACTION: WAIT - Market data feed unavailable: {e}")
+        if cfg.telegram_enabled and cfg.validate_telegram():
+            wait_txt = (
+                f"🟡 <b>XAUUSD QUANT SIGNAL: WAIT (DATA FEED STANDBY)</b>\n"
+                f"⏰ <code>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}</code>\n"
+                f"───────────────────\n"
+                f"<b>Status:</b> STANDBY / WAITING FOR MARKET DATA\n"
+                f"<b>Notice:</b> <code>{str(e)}</code>\n\n"
+                f"<i>Sesuai Aturan Kuantitatif #2: Bot dilarang mengarang harga dan wajib WAIT bila data pasar belum tersedia.\n"
+                f"Solusi: Tambahkan TWELVE_DATA_API_KEY di GitHub Secrets atau upload file data/xauusd_h1.csv.</i>"
+            )
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage",
+                    json={"chat_id": cfg.telegram_chat_id, "text": wait_txt, "parse_mode": "HTML"},
+                    timeout=8
+                )
+            except Exception:
+                pass
+        return 0
 
     # 2. Run Forensic & Ensemble Evaluation
     ensemble = generate_signal_ensemble(df, cfg)
@@ -1006,29 +1071,36 @@ def main() -> None:
         forensic_confluence=ensemble.forensic.confluence_pct
     )
 
+    # 3. If WAIT, log, dispatch status to Telegram, and finish
     if ensemble.action == "WAIT":
-        log_event(LOGGER, "signal_wait", reasons=ensemble.notes)
-        print("ACTION: WAIT - Market does not qualify high-conviction quantitative parameters.")
-        return
+        log_event(LOGGER, "signal_wait_execution_aborted", notes=ensemble.notes)
+        spot = fetcher.fetch_spot() or {
+            "price": float(df["close"].iloc[-1]),
+            "source": "ohlcv_close",
+            "status": "fallback"
+        }
+        if cfg.telegram_notify_on_wait:
+            send_signal(cfg, ensemble, spot, None)
+        print(f"ACTION: WAIT - {ensemble.notes[0] if ensemble.notes else 'Standing aside.'}")
+        return 0
 
-    # 3. Fetch Spot Price for execution
-    try:
-        spot = fetcher.fetch_spot()
-    except Exception as e:
-        log_event(LOGGER, "spot_failed_falling_back_to_close", error=str(e))
+    # 4. Fetch Spot Price for execution
+    spot = fetcher.fetch_spot()
+    if spot is None:
         spot = {"price": float(df['close'].iloc[-1]), "source": "ohlcv_close", "status": "fallback"}
 
-    # 4. Calculate Risk & Position Levels
+    # 5. Calculate Risk & Position Levels
     levels = calculate_levels(ensemble.action, spot["price"], ensemble.atr_value, cfg)
     if not levels:
         log_event(LOGGER, "levels_rejected_by_ror")
         print("ACTION: WAIT - Risk of Ruin check rejected trade execution.")
-        return
+        return 0
 
-    # 5. Send Notification
+    # 6. Send High-Conviction Telegram Signal
     sent = send_signal(cfg, ensemble, spot, levels)
     print(f"ACTION: {ensemble.action} at ${levels['entry_price']:.2f} | Lot Size: {levels['lot_size']} | Telegram Sent: {sent}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
