@@ -1,0 +1,31 @@
+symbol: "XAUUSD"
+timeframe: "H1"
+min_bars: 210
+ensemble_min_votes: 20
+agreement_threshold: 0.60
+weighted_score_threshold: 0.30
+account_balance: 10000.0
+risk_percent: 1.0
+max_risk_percent: 2.0
+sl_atr_multiplier: 1.5
+tp1_rrr: 2.0
+tp2_rrr: 3.0
+max_risk_of_ruin_pct: 5.0
+
+cache:
+  spot_ttl_seconds: 30
+  ohlcv_ttl_seconds: 900
+
+retry:
+  total: 3
+  backoff_factor: 0.5
+  status_forcelist: [429, 500, 502, 503, 504]
+
+circuit_breaker:
+  failure_threshold: 3
+  recovery_timeout_seconds: 600
+
+telegram:
+  enabled: true
+  parse_mode: "HTML"
+  disable_web_page_preview: true
