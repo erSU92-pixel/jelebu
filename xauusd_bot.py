@@ -5,7 +5,7 @@ Single-File Consolidated Architecture (Full Production Grade)
 Core Features:
   - Multi-Timeframe Confluence (H1 Macro + M15 Microstructure Execution)
   - 21-Voter Ensemble with Regime-Adaptive Dynamic Weights
-  - Deep Forensic Gating (Liquidity Sweeps, BB/KC Squeeze, Rejection Wicks >35%)
+  - Deep Forensic Gating (Liquidity Sweeps, Rejection Wicks >35%, Volume Ratio)
   - Volume Profile POC (Point of Control) Institutional Level Filter
   - SQLite Self-Auditing Performance Logger & Walk-Forward Audit DB
   - Dynamic ATR Volatility Lot Sizing & Chandelier Trailing Stop
@@ -239,7 +239,7 @@ def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
 
 
 # ============================================================================
-# 5. DATA FETCHER & MULTI-TIMEFRAME PIPELINE
+# 5. DATA FETCHER & ROBUST MULTI-TIMEFRAME PIPELINE
 # ============================================================================
 def create_retry_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
     session = requests.Session()
@@ -254,11 +254,21 @@ def fetch_twelvedata(session: requests.Session, api_key: str, interval: str, siz
     data = resp.json()
     values = data.get("values", [])
     if not values: raise ValueError(f"No OHLCV for {interval}")
+    
     df = pd.DataFrame(values).rename(columns={"datetime": "time"})
     df["time"] = pd.to_datetime(df["time"])
     df = df.sort_values("time", ascending=True).reset_index(drop=True)
-    for c in ["open", "high", "low", "close"]: df[c] = df[c].astype(float)
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+    
+    for c in ["open", "high", "low", "close"]: 
+        if c in df.columns:
+            df[c] = df[c].astype(float)
+            
+    # ROBUST VOLUME PARSING (Aman terhadap KeyError volume)
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0)
+    else:
+        df["volume"] = 1000.0
+        
     return df
 
 
@@ -291,7 +301,7 @@ class DataFetcher:
                 df_h1["time"] = pd.to_datetime(df_h1["datetime"] if "datetime" in df_h1.columns else df_h1["time"])
                 df_h1 = df_h1.sort_values("time", ascending=True).reset_index(drop=True)
                 for c in ["open", "high", "low", "close"]: df_h1[c] = df_h1[c].astype(float)
-                df_h1["volume"] = pd.to_numeric(df_h1["volume"], errors="coerce").fillna(1000.0)
+                df_h1["volume"] = pd.to_numeric(df_h1["volume"], errors="coerce").fillna(1000.0) if "volume" in df_h1.columns else 1000.0
 
         if df_m15 is None and df_h1 is not None:
             df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
@@ -329,31 +339,26 @@ class EnsembleResult:
 
 
 def evaluate_deep_forensics(df: pd.DataFrame) -> Tuple[float, str]:
-    """Analisis forensik mendalam: Liquidity Sweep, Rejection Wick, & CVD Proxy Delta."""
     last = df.iloc[-1]
     prev = df.iloc[-21:-1]
     op, hi, lo, cl = last['open'], last['high'], last['low'], last['close']
     rng = max(hi - lo, 0.01)
     
-    # Rejection Wick percentage
     upper_wick = hi - max(op, cl)
     lower_wick = min(op, cl) - lo
     max_wick = max(upper_wick, lower_wick)
     wick_pct = (max_wick / rng) * 100.0
 
-    # Liquidity Sweep detection
     highest_prev = prev['high'].max()
     lowest_prev = prev['low'].min()
     sweep = "NONE"
     if hi > highest_prev and cl < highest_prev: sweep = "BEARISH_SWEEP"
     elif lo < lowest_prev and cl > lowest_prev: sweep = "BULLISH_SWEEP"
 
-    # Volume ratio & CVD Proxy
     vol_ma = df['volume'].iloc[-21:-1].mean()
     vol_ratio = last['volume'] / (vol_ma + 1e-10)
 
-    # Menghitung skor konfluensi forensik (0 - 100%)
-    score = 40.0 # Base score
+    score = 40.0
     if sweep != "NONE": score += 30.0
     if wick_pct > 35.0: score += 15.0
     if vol_ratio > 1.2: score += 15.0
@@ -373,7 +378,6 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Con
     poc = volume_profile_poc(df_h1)
     forensic_score, sweep_type = evaluate_deep_forensics(df_h1)
 
-    # 21-Voter Core Logic
     ema50, ema200 = ema(close, 50).iloc[-1], ema(close, 200).iloc[-1]
     rsi_v = rsi(close, 14).iloc[-1]
 
@@ -387,7 +391,6 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Con
     agreement = bull_score / total_checks
     weighted_score = (agreement - 0.5) * 2.0
 
-    # M15 Microstructure validation
     m15_fast = ema(df_m15['close'], 9).iloc[-1]
     m15_slow = ema(df_m15['close'], 21).iloc[-1]
     m15_conf = "CONFIRMED_BULLISH" if m15_fast > m15_slow else "CONFIRMED_BEARISH"
@@ -395,7 +398,6 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Con
     action = "WAIT"
     notes = []
 
-    # Gating ketat untuk akurasi >95%
     if forensic_score < 75.0:
         notes.append(f"FORENSIC GATING FAILED: Konfluensi {forensic_score:.1f}% < 75% ambang batas presisi tinggi.")
     elif agreement >= cfg.agreement_threshold and m15_conf == "CONFIRMED_BULLISH":
