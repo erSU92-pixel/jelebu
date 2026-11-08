@@ -1,6 +1,6 @@
 """
-XAUUSD Forensic Walk-Backtester (Robust Auto-Fetch)
-Skrip untuk menguji akurasi Deep Forensic Gating pada data historis.
+XAUUSD Forensic Walk-Backtester (High-Precision Optimized)
+Skrip pengujian dengan Ambang Batas 85% & Filter Tren Makro EMA 200.
 """
 
 import os
@@ -10,6 +10,9 @@ import numpy as np
 from dotenv import load_dotenv
 
 load_dotenv()
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
 
 def fetch_historical_from_twelvedata(csv_path: str = "data/xauusd_h1.csv"):
     api_key = os.getenv("TWELVE_DATA_API_KEY")
@@ -22,7 +25,6 @@ def fetch_historical_from_twelvedata(csv_path: str = "data/xauusd_h1.csv"):
     resp.raise_for_status()
     data = resp.json()
     
-    # Cek apakah API mengembalikan error (misal: limit habis atau salah parameter)
     if "status" in data and data["status"] == "error":
         raise ValueError(f"TwelveData API Error: {data.get('message', 'Unknown error')}")
         
@@ -36,31 +38,19 @@ def fetch_historical_from_twelvedata(csv_path: str = "data/xauusd_h1.csv"):
     print(f"Berhasil menyimpan {len(df)} baris data ke {csv_path}")
 
 def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
-    # Hapus file jika kosong agar ter-download ulang dengan benar
     if os.path.exists(csv_path) and os.path.getsize(csv_path) == 0:
         os.remove(csv_path)
 
     if not os.path.exists(csv_path):
-        print(f"File {csv_path} tidak ditemukan.")
         try:
             fetch_historical_from_twelvedata(csv_path)
         except Exception as e:
             print(f"Error saat mendownload data otomatis: {e}")
             return
 
-    print(f"Memuat data historis dari {csv_path}...")
-    try:
-        df = pd.read_csv(csv_path)
-    except Exception as e:
-        print(f"Gagal memparsing CSV: {e}")
-        # Coba hapus file yang rusak dan unduh ulang sekali lagi
-        if os.path.exists(csv_path):
-            os.remove(csv_path)
-        fetch_historical_from_twelvedata(csv_path)
-        df = pd.read_csv(csv_path)
-
+    df = pd.read_csv(csv_path)
     if df.empty:
-        print("Error: File CSV terbaca kosong setelah diunduh.")
+        print("Error: File CSV terbaca kosong.")
         return
         
     df.columns = [c.strip().lower() for c in df.columns]
@@ -73,15 +63,18 @@ def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
             df[col] = df[col].astype(float)
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
 
+    # Hitung indikator pendukung makro (EMA 200)
+    df['ema200'] = ema(df['close'], 200)
+
     total_bars = len(df)
     print(f"Total bar data dimuat: {total_bars} bar H1.")
-    print("Menjalankan simulasi Walk-Forward Forensic Gating...\n")
+    print("Menjalankan simulasi Walk-Forward High-Precision Gating (Threshold >= 85%)...\n")
 
     triggered_signals = 0
     successful_trades = 0
     failed_trades = 0
 
-    for i in range(50, total_bars - 5):
+    for i in range(200, total_bars - 5):
         subset = df.iloc[:i]
         last = subset.iloc[-1]
         prev = subset.iloc[-21:-1]
@@ -105,12 +98,21 @@ def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
         vol_ma = subset['volume'].iloc[-21:-1].mean()
         vol_ratio = last['volume'] / (vol_ma + 1e-10)
 
-        score = 40.0
-        if sweep != "NONE": score += 30.0
-        if wick_pct > 35.0: score += 15.0
-        if vol_ratio > 1.2: score += 15.0
+        # Sistem Scoring Diperketat
+        score = 30.0 # Base score diturunkan agar selektif
+        if sweep != "NONE": score += 35.0
+        if wick_pct > 40.0: score += 20.0  # Wick rejection lebih ketat (>40%)
+        if vol_ratio > 1.5: score += 15.0  # Lonjakan volume lebih tinggi (>1.5x)
 
-        if score >= 75.0:
+        # Filter tambahan: Selaras dengan Tren Makro EMA 200
+        macro_aligned = True
+        if sweep == "BULLISH_SWEEP" and cl < last['ema200']:
+            macro_aligned = False
+        elif sweep == "BEARISH_SWEEP" and cl > last['ema200']:
+            macro_aligned = False
+
+        # Gate Presisi Tinggi: Skor >= 85% DAN Selaras Tren Makro
+        if score >= 85.0 and macro_aligned:
             triggered_signals += 1
             future_close = df.iloc[i + 5]['close']
             if sweep == "BULLISH_SWEEP" and future_close > cl:
@@ -122,15 +124,15 @@ def run_forensic_backtest(csv_path: str = "data/xauusd_h1.csv"):
 
     win_rate = (successful_trades / triggered_signals * 100.0) if triggered_signals > 0 else 0.0
     
-    print("=" * 45)
-    print("HASIL LAPORAN BACKTEST FORENSIK XAUUSD")
-    print("=" * 45)
+    print("=" * 50)
+    print("HASIL LAPORAN HIGH-PRECISION FORENSIC BACKTEST")
+    print("=" * 50)
     print(f"Total Bar Diuji          : {total_bars}")
-    print(f"Sinyal Lolos Gate (>=75%): {triggered_signals}")
+    print(f"Sinyal Lolos Gate (>=85%): {triggered_signals}")
     print(f"Prediksi Berhasil        : {successful_trades}")
     print(f"Prediksi Gagal           : {failed_trades}")
-    print(f"Forensic Win Rate        : {win_rate:.2f}%")
-    print("=" * 45)
+    print(f"High-Precision Win Rate  : {win_rate:.2f}%")
+    print("=" * 50)
 
 if __name__ == "__main__":
     run_forensic_backtest()
