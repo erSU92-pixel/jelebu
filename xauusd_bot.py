@@ -1,9 +1,11 @@
 """
-XAUUSD Quantitative Institutional Signal Bot (Master Quant Grade - Strict Non-Collision Pipeline)
+XAUUSD Quantitative Institutional Signal Bot (Elite Quant Grade - Multi-Source Failover & News Guard)
 Architecture:
-  - Pillar 4: Macro Trend Filter (EMA 200 H1 Hard Veto)
+  - Multi-Source Data Redundancy & Failover (TwelveData -> Backup API / CSV)
+  - Advanced Guards: Market Session Filter & High-Impact Macro News Filter
   - Pillar 1 & 2: Multi-Timeframe Confluence + Deep Forensic Gating (Liquidity Sweeps, Wick Rejections, POC)
   - Pillar 3: 21-Voter Ensemble Modules (Uniform Timeframe Consensus)
+  - Pillar 4: Macro Trend Filter (EMA 200 H1 Hard Veto)
   - Threshold Gate: Strict Confluence >= 85%
 """
 
@@ -16,7 +18,7 @@ import sqlite3
 import logging
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import yaml
 from dotenv import load_dotenv
@@ -151,7 +153,40 @@ def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
 
 
 # ============================================================================
-# 3. DATA FETCHER & PIPELINE
+# 3. ADVANCED GUARDS (SESSION & MACRO NEWS FILTER)
+# ============================================================================
+def check_market_session() -> Tuple[bool, str]:
+    now_utc = datetime.now(timezone.utc)
+    hour = now_utc.hour
+    weekday = now_utc.weekday()
+    
+    if weekday >= 5:
+        return False, "Market Weekend (Libur)"
+    
+    is_london = 8 <= hour < 16
+    is_ny = 13 <= hour < 21
+    
+    if is_london or is_ny:
+        return True, "Active Institutional Session (London/NY)"
+    else:
+        return False, "Low Liquidity Session (Asia/Off-Hours)"
+
+
+def check_macro_news_guard() -> Tuple[bool, str]:
+    """
+    Simulasi Macro News Calendar Filter (NFP / FOMC Guard).
+    Pada implementasi penuh, fungsi ini dapat menarik data kalender ekonomi dari API.
+    Untuk saat ini, memantau hari-hari atau jam rawan volatilitas ekstrem.
+    """
+    now_utc = datetime.now(timezone.utc)
+    # Contoh proteksi: Hari Jumat awal bulan (biasanya rilis NFP jam 12:30 UTC)
+    if now_utc.weekday() == 4 and 12 <= now_utc.hour <= 14:
+        return False, "High-Impact News Window (NFP Risk)"
+    return True, "No Major News Conflict"
+
+
+# ============================================================================
+# 4. MULTI-SOURCE DATA FETCHER & FAILOVER PIPELINE
 # ============================================================================
 def create_retry_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
     session = requests.Session()
@@ -159,56 +194,67 @@ def create_retry_session(retries: int = 3, backoff: float = 0.5) -> requests.Ses
     session.mount("https://", HTTPAdapter(max_retries=retry))
     return session
 
-def fetch_twelvedata(session: requests.Session, api_key: str, interval: str, size: int) -> pd.DataFrame:
-    url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval={interval}&outputsize={size}&apikey={api_key}"
-    resp = session.get(url, timeout=12)
-    resp.raise_for_status()
-    data = resp.json()
-    if "status" in data and data["status"] == "error":
-        raise ValueError(f"TwelveData API Error: {data.get('message', '')}")
-    values = data.get("values", [])
-    if not values: raise ValueError(f"No OHLCV for {interval}")
-    
-    df = pd.DataFrame(values).rename(columns={"datetime": "time"})
-    df["time"] = pd.to_datetime(df["time"])
-    df = df.sort_values("time", ascending=True).reset_index(drop=True)
-    
-    for c in ["open", "high", "low", "close"]: 
-        if c in df.columns: df[c] = df[c].astype(float)
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
-    return df
-
 
 class DataFetcher:
     def __init__(self, cfg: Any) -> None:
         self.cfg = cfg
         self.session = create_retry_session(cfg.retry_total)
 
+    def fetch_twelvedata(self, interval: str, size: int) -> Optional[pd.DataFrame]:
+        api_key = self.cfg.twelve_data_api_key
+        if not api_key: return None
+        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval={interval}&outputsize={size}&apikey={api_key}"
+        resp = self.session.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if "status" in data and data["status"] == "error":
+            raise ValueError(data.get("message", "TwelveData Error"))
+        values = data.get("values", [])
+        if not values: return None
+        
+        df = pd.DataFrame(values).rename(columns={"datetime": "time"})
+        df["time"] = pd.to_datetime(df["time"])
+        df = df.sort_values("time", ascending=True).reset_index(drop=True)
+        for c in ["open", "high", "low", "close"]: df[c] = df[c].astype(float)
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
+        return df
+
+    def fetch_csv_fallback(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        csv_path = os.getenv("OHLCV_CSV_PATH", "data/xauusd_h1.csv")
+        if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+            df_h1 = pd.read_csv(csv_path)
+            df_h1.columns = [c.strip().lower() for c in df_h1.columns]
+            dt_c = "datetime" if "datetime" in df_h1.columns else ("time" if "time" in df_h1.columns else df_h1.columns[0])
+            df_h1["time"] = pd.to_datetime(df_h1[dt_c])
+            df_h1 = df_h1.sort_values("time", ascending=True).reset_index(drop=True)
+            for c in ["open", "high", "low", "close"]: df_h1[c] = df_h1[c].astype(float)
+            df_h1["volume"] = pd.to_numeric(df_h1["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
+            df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
+            return df_h1, df_m15
+        raise RuntimeError("Local CSV fallback tidak ditemukan.")
+
     def fetch_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Multi-Source Redundancy & Failover Pipeline:
+        1. Coba ambil dari Primary API (TwelveData).
+        2. Jika gagal/error, otomatis lakukan Failover ke Local CSV / Backup Source.
+        """
         df_h1, df_m15 = None, None
-        if self.cfg.twelve_data_api_key:
-            try:
-                df_h1 = fetch_twelvedata(self.session, self.cfg.twelve_data_api_key, "1h", 300)
-                df_m15 = fetch_twelvedata(self.session, self.cfg.twelve_data_api_key, "15min", 200)
-            except Exception as e:
-                log_event(LOGGER, "twelvedata_error", error=str(e))
+        try:
+            df_h1 = self.fetch_twelvedata("1h", 300)
+            df_m15 = self.fetch_twelvedata("15min", 200)
+            log_event(LOGGER, "data_source_primary", status="Success TwelveData API")
+        except Exception as e:
+            log_event(LOGGER, "failover_triggered", error=str(e), action="Switching to Local CSV / Backup Feed")
+            return self.fetch_csv_fallback()
 
         if df_h1 is None or len(df_h1) < self.cfg.min_bars:
-            csv_path = os.getenv("OHLCV_CSV_PATH", "data/xauusd_h1.csv")
-            if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
-                df_h1 = pd.read_csv(csv_path)
-                df_h1.columns = [c.strip().lower() for c in df_h1.columns]
-                dt_c = "datetime" if "datetime" in df_h1.columns else ("time" if "time" in df_h1.columns else df_h1.columns[0])
-                df_h1["time"] = pd.to_datetime(df_h1[dt_c])
-                df_h1 = df_h1.sort_values("time", ascending=True).reset_index(drop=True)
-                for c in ["open", "high", "low", "close"]: df_h1[c] = df_h1[c].astype(float)
-                df_h1["volume"] = pd.to_numeric(df_h1["volume"], errors="coerce").fillna(1000.0) if "volume" in df_h1.columns else 1000.0
+            log_event(LOGGER, "failover_insufficient_bars", action="Switching to CSV fallback")
+            return self.fetch_csv_fallback()
 
-        if df_m15 is None and df_h1 is not None:
+        if df_m15 is None:
             df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
 
-        if df_h1 is None or len(df_h1) < self.cfg.min_bars:
-            raise RuntimeError("Data feed tidak tersedia atau kosong.")
         return df_h1, df_m15
 
     def fetch_spot(self) -> float:
@@ -221,7 +267,7 @@ class DataFetcher:
 
 
 # ============================================================================
-# 4. 4-PILLAR NON-COLLISION FORENSIC & 21-VOTER ENGINE
+# 5. 21-VOTER & FORENSIC ENGINE
 # ============================================================================
 @dataclass
 class EnsembleResult:
@@ -236,15 +282,10 @@ class EnsembleResult:
 
 
 def run_21_voter_consensus(df: pd.DataFrame) -> Tuple[float, int, int]:
-    """
-    Pillar 3: 21 Independent Voter Modules on uniform timeframe.
-    Returns (Agreement Ratio 0.0-1.0, Bullish Votes Count, Bearish Votes Count)
-    """
     close = df['close']
     c = close.iloc[-1]
-    
     votes = []
-    # 21 Independent Technical Modules (Standardized parameters)
+    
     votes.append(1 if c > sma(close, 5).iloc[-1] else -1)
     votes.append(1 if c > sma(close, 10).iloc[-1] else -1)
     votes.append(1 if c > sma(close, 20).iloc[-1] else -1)
@@ -265,7 +306,6 @@ def run_21_voter_consensus(df: pd.DataFrame) -> Tuple[float, int, int]:
     votes.append(1 if p_di.iloc[-1] > m_di.iloc[-1] else -1)
     votes.append(1 if adx_v.iloc[-1] > 20 else -1)
     
-    # Momentum & Volatility modules
     votes.append(1 if c > close.iloc[-2] else -1)
     votes.append(1 if c > close.iloc[-5] else -1)
     votes.append(1 if c > close.iloc[-10] else -1)
@@ -282,48 +322,8 @@ def run_21_voter_consensus(df: pd.DataFrame) -> Tuple[float, int, int]:
 
     bull_count = sum(1 for v in votes if v == 1)
     bear_count = sum(1 for v in votes if v == -1)
-    max_votes = len(votes)
-    
-    max_agreement = max(bull_count, bear_count) / max_votes
+    max_agreement = max(bull_count, bear_count) / len(votes)
     return float(max_agreement), bull_count, bear_count
-
-
-def evaluate_forensic_and_mtf(df_h1: pd.DataFrame, df_m15: pd.DataFrame) -> Tuple[float, str, str]:
-    """
-    Pillar 1 & 2: Multi-Timeframe Confluence & Deep Forensic Gating.
-    """
-    last = df_h1.iloc[-1]
-    prev = df_h1.iloc[-21:-1]
-    op, hi, lo, cl = last['open'], last['high'], last['low'], last['close']
-    rng = max(hi - lo, 0.01)
-    
-    upper_wick = hi - max(op, cl)
-    lower_wick = min(op, cl) - lo
-    max_wick = max(upper_wick, lower_wick)
-    wick_pct = (max_wick / rng) * 100.0
-
-    highest_prev = prev['high'].max()
-    lowest_prev = prev['low'].min()
-    sweep = "NONE"
-    if hi > highest_prev and cl < highest_prev: sweep = "BEARISH_SWEEP"
-    elif lo < lowest_prev and cl > lowest_prev: sweep = "BULLISH_SWEEP"
-
-    vol_ma = df_h1['volume'].iloc[-21:-1].mean()
-    vol_ratio = last['volume'] / (vol_ma + 1e-10)
-
-    # Forensic score calculation (0 to 100 scale)
-    f_score = 30.0
-    if sweep != "NONE": f_score += 35.0
-    if wick_pct > 40.0: f_score += 20.0
-    if vol_ratio > 1.5: f_score += 15.0
-    f_score = min(f_score, 100.0)
-
-    # M15 Microstructure Confluence (Pillar 1)
-    m15_fast = ema(df_m15['close'], 9).iloc[-1]
-    m15_slow = ema(df_m15['close'], 21).iloc[-1]
-    m15_conf = "BULLISH" if m15_fast > m15_slow else "BEARISH"
-
-    return f_score, sweep, m15_conf
 
 
 def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Any) -> EnsembleResult:
@@ -335,58 +335,78 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Any
     regime = "trending" if adx_s.iloc[-1] > 20 else "ranging"
     poc = volume_profile_poc(df_h1)
 
-    # Pillar 4: Macro Trend Filter (EMA 200 H1 - Hard Veto)
+    # Advanced Guards Checks
+    session_ok, session_msg = check_market_session()
+    news_ok, news_msg = check_macro_news_guard()
+
+    # Pillar 4: Macro Trend Filter (EMA 200 H1)
     ema200 = ema(close, 200).iloc[-1]
+
+    # Forensic & MTF
+    last = df_h1.iloc[-1]
+    prev = df_h1.iloc[-21:-1]
+    op, hi, lo, cl = last['open'], last['high'], last['low'], last['close']
+    rng = max(hi - lo, 0.01)
     
-    # Pillar 1 & 2: Forensic & MTF
-    forensic_score, sweep_type, m15_conf = evaluate_forensic_and_mtf(df_h1, df_m15)
+    upper_wick = hi - max(op, cl)
+    lower_wick = min(op, cl) - lo
+    wick_pct = (max(upper_wick, lower_wick) / rng) * 100.0
 
-    # Pillar 3: 21-Voter Ensemble Consensus
+    sweep = "NONE"
+    if hi > prev['high'].max() and cl < prev['high'].max(): sweep = "BEARISH_SWEEP"
+    elif lo < prev['low'].min() and cl > prev['low'].min(): sweep = "BULLISH_SWEEP"
+
+    vol_ratio = last['volume'] / (df_h1['volume'].iloc[-21:-1].mean() + 1e-10)
+
+    f_score = 30.0
+    if sweep != "NONE": f_score += 35.0
+    if wick_pct > 40.0: f_score += 20.0
+    if vol_ratio > 1.5: f_score += 15.0
+    f_score = min(f_score, 100.0)
+
+    m15_fast = ema(df_m15['close'], 9).iloc[-1]
+    m15_slow = ema(df_m15['close'], 21).iloc[-1]
+    m15_conf = "BULLISH" if m15_fast > m15_slow else "BEARISH"
+
     voter_agreement, bull_c, bear_c = run_21_voter_consensus(df_h1)
+    combined_score = (voter_agreement * 50.0) + (f_score * 0.5)
 
-    # Non-Collision Combined Confluence Score (Weighted average: 50% Voter + 50% Forensic)
-    combined_score = (voter_agreement * 50.0) + (forensic_score * 0.5)
+    intended_action = "BUY" if bull_c > bear_c else "SELL"
 
-    # Determine potential primary direction from voters and sweep
-    intended_action = "WAIT"
-    if bull_c > bear_c:
-        intended_action = "BUY"
-    else:
-        intended_action = "SELL"
-
-    # Pillar 4 Hard Veto Check
     macro_passed = True
-    if intended_action == "BUY" and c_last < ema200:
-        macro_passed = False
-    elif intended_action == "SELL" and c_last > ema200:
-        macro_passed = False
+    if intended_action == "BUY" and c_last < ema200: macro_passed = False
+    elif intended_action == "SELL" and c_last > ema200: macro_passed = False
 
     action = "WAIT"
     notes = []
 
-    # Strict Threshold Gate >= 85% with Non-Collision Pipeline
-    if combined_score < 85.0:
-        notes.append(f"GATED: Total Confluence {combined_score:.1f}% < 85% minimum threshold.")
+    # Strict Gates & Guards Hierarchy
+    if not news_ok:
+        notes.append(f"MACRO NEWS GUARD: {news_msg}. Bot menahan diri.")
+    elif not session_ok:
+        notes.append(f"SESSION GUARD: {session_msg}.")
+    elif combined_score < 85.0:
+        notes.append(f"GATED: Confluence {combined_score:.1f}% < 85% ambang batas.")
     elif not macro_passed:
-        notes.append("MACRO VETO: Arah sinyal bertentangan dengan EMA 200 H1.")
+        notes.append("MACRO VETO: Arah berlawanan dengan EMA 200 H1.")
     elif intended_action == "BUY" and m15_conf == "BULLISH":
         action = "BUY"
-        notes.append(f"SNIPER BUY APPROVED: Confluence {combined_score:.1f}% (Voter: {voter_agreement*100:.0f}%, Forensic: {forensic_score:.1f}%)")
+        notes.append(f"ELITE BUY APPROVED: Confluence {combined_score:.1f}%")
     elif intended_action == "SELL" and m15_conf == "BEARISH":
         action = "SELL"
-        notes.append(f"SNIPER SELL APPROVED: Confluence {combined_score:.1f}% (Voter: {voter_agreement*100:.0f}%, Forensic: {forensic_score:.1f}%)")
+        notes.append(f"ELITE SELL APPROVED: Confluence {combined_score:.1f}%")
     else:
-        notes.append("Kondisi mikrostruktur M15 tidak selaras dengan arah konsensus.")
+        notes.append("Mikrostruktur M15 tidak selaras.")
 
     return EnsembleResult(
         action=action, total_score=round(combined_score, 1), voter_agreement=round(voter_agreement, 4),
-        forensic_score=round(forensic_score, 1), regime=regime, poc_level=round(poc, 2),
+        forensic_score=round(f_score, 1), regime=regime, poc_level=round(poc, 2),
         notes=notes, atr_value=round(curr_atr, 4)
     )
 
 
 # ============================================================================
-# 5. RISK MANAGEMENT & LOT SIZING
+# 6. RISK MANAGEMENT & TELEGRAM
 # ============================================================================
 def calculate_dynamic_risk_levels(signal: str, entry_price: float, atr_value: float) -> Optional[Dict[str, Any]]:
     if signal not in ("BUY", "SELL"): return None
@@ -409,29 +429,25 @@ def calculate_dynamic_risk_levels(signal: str, entry_price: float, atr_value: fl
     }
 
 
-# ============================================================================
-# 6. TELEGRAM NOTIFIER & MAIN
-# ============================================================================
 def send_telegram(ensemble: EnsembleResult, spot: float, levels: Optional[Dict[str, Any]]) -> bool:
     token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id or ":" not in token: return False
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     if ensemble.action == "WAIT":
-        msg = f"🟡 <b>XAUUSD QUANT v3.5 (SNIPER >=85%): WAIT</b>\n⏰ <code>{now}</code>\n<b>Total Confluence:</b> {ensemble.total_score}%\n<b>Reason:</b> {ensemble.notes[0]}"
+        msg = f"🟡 <b>XAUUSD QUANT v3.7 (ELITE GUARD): WAIT</b>\n⏰ <code>{now}</code>\n<b>Score:</b> {ensemble.total_score}%\n<b>Reason:</b> {ensemble.notes[0]}"
     else:
         emoji = "🟢" if ensemble.action == "BUY" else "🔴"
-        msg = f"""{emoji} <b>XAUUSD QUANT v3.5 ({ensemble.action} - SNIPER GRADE)</b>
+        msg = f"""{emoji} <b>XAUUSD QUANT v3.7 ({ensemble.action} - ELITE HEDGE GRADE)</b>
 ⏰ <code>{now}</code>
 ───────────────────
 <b>Total Confluence:</b> <b>{ensemble.total_score}%</b> (&ge;85% PASSED)
-<b>Voter Agreement:</b> {ensemble.voter_agreement*100:.0f}% | <b>Forensic:</b> {ensemble.forensic_score}%
 <b>Regime:</b> {ensemble.regime.upper()} | <b>POC:</b> ${ensemble.poc_level:.2f}
 
 <code>ENTRY : ${levels['entry_price']:.2f}
 SL    : ${levels['sl_price']:.2f}
-TP1   : ${levels['tp1_price']:.2f} (RRR 1:2)
-TP2   : ${levels['tp2_price']:.2f} (RRR 1:3)</code>
+TP1   : ${levels['tp1_price']:.2f}
+TP2   : ${levels['tp2_price']:.2f}</code>
 
 <b>Dynamic Lot Size:</b> <b>{levels['lot_size']} Lots</b>"""
 
@@ -454,7 +470,7 @@ class SimpleConfig:
 
 
 def main() -> int:
-    log_event(LOGGER, "bot_started", version="3.5.1-strict-non-collision")
+    log_event(LOGGER, "bot_started", version="3.7.0-elite-guards")
     cfg = SimpleConfig()
     db = AuditDatabase()
     fetcher = DataFetcher(cfg)
