@@ -1,4 +1,4 @@
-name: XAUUSD Quant Bot Elite v3.7
+name: XAUUSD Quant Bot Elite v3.9
 
 on:
   schedule:
@@ -22,7 +22,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy pyyaml python-dotenv
+          pip install requests pandas numpy pyyaml python-dotenv yfinance
 
       - name: Execute XAUUSD Quant Bot
         env:
