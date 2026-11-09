@@ -1,12 +1,13 @@
 """
-XAUUSD Quantitative Institutional Signal Bot (Elite Quant Grade - Multi-Source Failover & News Guard)
+XAUUSD Quantitative Institutional Signal Bot (Master Quant Grade v3.8 - Dynamic Multi-Strategy & Smart Risk)
 Architecture:
-  - Multi-Source Data Redundancy & Failover (TwelveData -> Backup API / CSV)
-  - Advanced Guards: Market Session Filter & High-Impact Macro News Filter
+  - Dynamic Session Profiles (Asia Mean Reversion Mode vs London/NY Sniper Trend Mode)
+  - Volatility Regime Switch (ATR & ADX Adaptive Volatility Tuning)
+  - Multi-Timeframe Volume Confirmation (H1 Macro + M15 Micro Volume Spike Guard)
+  - Smart Trailing & Break-Even Logic (Dynamic TP1, TP2, and Break-Even SL levels)
   - Pillar 1 & 2: Multi-Timeframe Confluence + Deep Forensic Gating (Liquidity Sweeps, Wick Rejections, POC)
   - Pillar 3: 21-Voter Ensemble Modules (Uniform Timeframe Consensus)
   - Pillar 4: Macro Trend Filter (EMA 200 H1 Hard Veto)
-  - Threshold Gate: Strict Confluence >= 85%
 """
 
 import os
@@ -153,33 +154,32 @@ def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
 
 
 # ============================================================================
-# 3. ADVANCED GUARDS (SESSION & MACRO NEWS FILTER)
+# 3. ADVANCED DYNAMIC PROFILES & GUARDS
 # ============================================================================
-def check_market_session() -> Tuple[bool, str]:
+def get_dynamic_session_profile() -> Tuple[str, bool, float, float]:
+    """
+    Mengembalikan profil parameter dinamis berdasarkan sesi pasar UTC:
+    Format: (nama_sesi, diizinkan_trading, min_threshold, atr_multiplier)
+    - Sesi Asia (00:00 - 08:00 UTC): Mode Mean Reversion / Range (Threshold 75%, ATR 1.0)
+    - Sesi London & NY (08:00 - 21:00 UTC): Mode Trend Sniper (Threshold 85%, ATR 1.5)
+    """
     now_utc = datetime.now(timezone.utc)
     hour = now_utc.hour
-    weekday = now_utc.weekday()
+    weekday = now_utc.weekday() # 5 = Sabtu, 6 = Minggu
     
     if weekday >= 5:
-        return False, "Market Weekend (Libur)"
+        return "WEEKEND", False, 99.0, 1.0
     
-    is_london = 8 <= hour < 16
-    is_ny = 13 <= hour < 21
-    
-    if is_london or is_ny:
-        return True, "Active Institutional Session (London/NY)"
+    if 0 <= hour < 8:
+        return "ASIA_RANGE_MODE", True, 75.0, 1.0
+    elif 8 <= hour < 21:
+        return "LONDON_NY_SNIPER_MODE", True, 85.0, 1.5
     else:
-        return False, "Low Liquidity Session (Asia/Off-Hours)"
+        return "OFF_HOURS", False, 99.0, 1.0
 
 
 def check_macro_news_guard() -> Tuple[bool, str]:
-    """
-    Simulasi Macro News Calendar Filter (NFP / FOMC Guard).
-    Pada implementasi penuh, fungsi ini dapat menarik data kalender ekonomi dari API.
-    Untuk saat ini, memantau hari-hari atau jam rawan volatilitas ekstrem.
-    """
     now_utc = datetime.now(timezone.utc)
-    # Contoh proteksi: Hari Jumat awal bulan (biasanya rilis NFP jam 12:30 UTC)
     if now_utc.weekday() == 4 and 12 <= now_utc.hour <= 14:
         return False, "High-Impact News Window (NFP Risk)"
     return True, "No Major News Conflict"
@@ -228,28 +228,21 @@ class DataFetcher:
             df_h1["time"] = pd.to_datetime(df_h1[dt_c])
             df_h1 = df_h1.sort_values("time", ascending=True).reset_index(drop=True)
             for c in ["open", "high", "low", "close"]: df_h1[c] = df_h1[c].astype(float)
-            df_h1["volume"] = pd.to_numeric(df_h1["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
+            df_h1["volume"] = pd.to_numeric(df_h1["volume"], errors="coerce").fillna(1000.0) if "volume" in df_h1.columns else 1000.0
             df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
             return df_h1, df_m15
         raise RuntimeError("Local CSV fallback tidak ditemukan.")
 
     def fetch_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        Multi-Source Redundancy & Failover Pipeline:
-        1. Coba ambil dari Primary API (TwelveData).
-        2. Jika gagal/error, otomatis lakukan Failover ke Local CSV / Backup Source.
-        """
-        df_h1, df_m15 = None, None
         try:
             df_h1 = self.fetch_twelvedata("1h", 300)
             df_m15 = self.fetch_twelvedata("15min", 200)
             log_event(LOGGER, "data_source_primary", status="Success TwelveData API")
         except Exception as e:
-            log_event(LOGGER, "failover_triggered", error=str(e), action="Switching to Local CSV / Backup Feed")
+            log_event(LOGGER, "failover_triggered", error=str(e), action="Switching to Local CSV")
             return self.fetch_csv_fallback()
 
         if df_h1 is None or len(df_h1) < self.cfg.min_bars:
-            log_event(LOGGER, "failover_insufficient_bars", action="Switching to CSV fallback")
             return self.fetch_csv_fallback()
 
         if df_m15 is None:
@@ -267,7 +260,7 @@ class DataFetcher:
 
 
 # ============================================================================
-# 5. 21-VOTER & FORENSIC ENGINE
+# 5. 21-VOTER & MASTER ENSEMBLE ENGINE
 # ============================================================================
 @dataclass
 class EnsembleResult:
@@ -279,6 +272,7 @@ class EnsembleResult:
     poc_level: float
     notes: List[str]
     atr_value: float
+    atr_multiplier: float
 
 
 def run_21_voter_consensus(df: pd.DataFrame) -> Tuple[float, int, int]:
@@ -335,14 +329,14 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Any
     regime = "trending" if adx_s.iloc[-1] > 20 else "ranging"
     poc = volume_profile_poc(df_h1)
 
-    # Advanced Guards Checks
-    session_ok, session_msg = check_market_session()
+    # Dynamic Session Profile & Thresholds
+    session_name, session_ok, min_threshold, atr_multiplier = get_dynamic_session_profile()
     news_ok, news_msg = check_macro_news_guard()
 
     # Pillar 4: Macro Trend Filter (EMA 200 H1)
     ema200 = ema(close, 200).iloc[-1]
 
-    # Forensic & MTF
+    # Forensic Gating & MTF Volume Confirmation
     last = df_h1.iloc[-1]
     prev = df_h1.iloc[-21:-1]
     op, hi, lo, cl = last['open'], last['high'], last['low'], last['close']
@@ -356,12 +350,14 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Any
     if hi > prev['high'].max() and cl < prev['high'].max(): sweep = "BEARISH_SWEEP"
     elif lo < prev['low'].min() and cl > prev['low'].min(): sweep = "BULLISH_SWEEP"
 
-    vol_ratio = last['volume'] / (df_h1['volume'].iloc[-21:-1].mean() + 1e-10)
+    # Multi-Timeframe Volume Spike Confirmation (H1 & M15)
+    h1_vol_ratio = last['volume'] / (df_h1['volume'].iloc[-21:-1].mean() + 1e-10)
+    m15_vol_ratio = df_m15['volume'].iloc[-1] / (df_m15['volume'].iloc[-20:].mean() + 1e-10)
 
     f_score = 30.0
     if sweep != "NONE": f_score += 35.0
     if wick_pct > 40.0: f_score += 20.0
-    if vol_ratio > 1.5: f_score += 15.0
+    if h1_vol_ratio > 1.2 or m15_vol_ratio > 1.3: f_score += 15.0
     f_score = min(f_score, 100.0)
 
     m15_fast = ema(df_m15['close'], 9).iloc[-1]
@@ -380,52 +376,56 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Any
     action = "WAIT"
     notes = []
 
-    # Strict Gates & Guards Hierarchy
+    # Evaluation with Dynamic Session Rules
     if not news_ok:
-        notes.append(f"MACRO NEWS GUARD: {news_msg}. Bot menahan diri.")
+        notes.append(f"MACRO NEWS GUARD: {news_msg}.")
     elif not session_ok:
-        notes.append(f"SESSION GUARD: {session_msg}.")
-    elif combined_score < 85.0:
-        notes.append(f"GATED: Confluence {combined_score:.1f}% < 85% ambang batas.")
+        notes.append(f"SESSION GUARD: Di luar jam operasional ({session_name}).")
+    elif combined_score < min_threshold:
+        notes.append(f"GATED: Confluence {combined_score:.1f}% < {min_threshold}% ({session_name}).")
     elif not macro_passed:
         notes.append("MACRO VETO: Arah berlawanan dengan EMA 200 H1.")
     elif intended_action == "BUY" and m15_conf == "BULLISH":
         action = "BUY"
-        notes.append(f"ELITE BUY APPROVED: Confluence {combined_score:.1f}%")
+        notes.append(f"APPROVED [{session_name}]: Confluence {combined_score:.1f}%")
     elif intended_action == "SELL" and m15_conf == "BEARISH":
         action = "SELL"
-        notes.append(f"ELITE SELL APPROVED: Confluence {combined_score:.1f}%")
+        notes.append(f"APPROVED [{session_name}]: Confluence {combined_score:.1f}%")
     else:
         notes.append("Mikrostruktur M15 tidak selaras.")
 
     return EnsembleResult(
         action=action, total_score=round(combined_score, 1), voter_agreement=round(voter_agreement, 4),
         forensic_score=round(f_score, 1), regime=regime, poc_level=round(poc, 2),
-        notes=notes, atr_value=round(curr_atr, 4)
+        notes=notes, atr_value=round(curr_atr, 4), atr_multiplier=atr_multiplier
     )
 
 
 # ============================================================================
-# 6. RISK MANAGEMENT & TELEGRAM
+# 6. RISK MANAGEMENT & SMART TRAILING LEVELS
 # ============================================================================
-def calculate_dynamic_risk_levels(signal: str, entry_price: float, atr_value: float) -> Optional[Dict[str, Any]]:
+def calculate_dynamic_risk_levels(signal: str, entry_price: float, atr_value: float, atr_multiplier: float) -> Optional[Dict[str, Any]]:
     if signal not in ("BUY", "SELL"): return None
-    sl_dist = max(atr_value * 1.5, 1.0)
+    
+    sl_dist = max(atr_value * atr_multiplier, 1.0)
     risk_usd = 10000.0 * 0.01
     lot_size = round(max(risk_usd / (sl_dist * 100.0), 0.01), 2)
 
     if signal == "BUY":
         sl_price = entry_price - sl_dist
-        tp1_price = entry_price + (sl_dist * 2.0)
-        tp2_price = entry_price + (sl_dist * 3.0)
+        tp1_price = entry_price + (sl_dist * 1.5)
+        tp2_price = entry_price + (sl_dist * 2.5)
+        be_price = entry_price + (sl_dist * 0.8) # Break-even trigger target
     else:
         sl_price = entry_price + sl_dist
-        tp1_price = entry_price - (sl_dist * 2.0)
-        tp2_price = entry_price - (sl_dist * 3.0)
+        tp1_price = entry_price - (sl_dist * 1.5)
+        tp2_price = entry_price - (sl_dist * 2.5)
+        be_price = entry_price - (sl_dist * 0.8)
 
     return {
         "entry_price": round(entry_price, 2), "sl_price": round(sl_price, 2),
-        "tp1_price": round(tp1_price, 2), "tp2_price": round(tp2_price, 2), "lot_size": lot_size
+        "tp1_price": round(tp1_price, 2), "tp2_price": round(tp2_price, 2),
+        "break_even_trigger": round(be_price, 2), "lot_size": lot_size
     }
 
 
@@ -435,19 +435,20 @@ def send_telegram(ensemble: EnsembleResult, spot: float, levels: Optional[Dict[s
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     if ensemble.action == "WAIT":
-        msg = f"🟡 <b>XAUUSD QUANT v3.7 (ELITE GUARD): WAIT</b>\n⏰ <code>{now}</code>\n<b>Score:</b> {ensemble.total_score}%\n<b>Reason:</b> {ensemble.notes[0]}"
+        msg = f"🟡 <b>XAUUSD QUANT v3.8 (DYNAMIC GUARD): WAIT</b>\n⏰ <code>{now}</code>\n<b>Score:</b> {ensemble.total_score}%\n<b>Reason:</b> {ensemble.notes[0]}"
     else:
         emoji = "🟢" if ensemble.action == "BUY" else "🔴"
-        msg = f"""{emoji} <b>XAUUSD QUANT v3.7 ({ensemble.action} - ELITE HEDGE GRADE)</b>
+        msg = f"""{emoji} <b>XAUUSD QUANT v3.8 ({ensemble.action} - MASTER QUANT)</b>
 ⏰ <code>{now}</code>
 ───────────────────
-<b>Total Confluence:</b> <b>{ensemble.total_score}%</b> (&ge;85% PASSED)
-<b>Regime:</b> {ensemble.regime.upper()} | <b>POC:</b> ${ensemble.poc_level:.2f}
+<b>Confluence:</b> <b>{ensemble.total_score}%</b> | <b>Regime:</b> {ensemble.regime.upper()}
+<b>POC Level:</b> ${ensemble.poc_level:.2f}
 
 <code>ENTRY : ${levels['entry_price']:.2f}
 SL    : ${levels['sl_price']:.2f}
 TP1   : ${levels['tp1_price']:.2f}
-TP2   : ${levels['tp2_price']:.2f}</code>
+TP2   : ${levels['tp2_price']:.2f}
+BE At : ${levels['break_even_trigger']:.2f}</code>
 
 <b>Dynamic Lot Size:</b> <b>{levels['lot_size']} Lots</b>"""
 
@@ -470,7 +471,7 @@ class SimpleConfig:
 
 
 def main() -> int:
-    log_event(LOGGER, "bot_started", version="3.7.0-elite-guards")
+    log_event(LOGGER, "bot_started", version="3.8.0-dynamic-master")
     cfg = SimpleConfig()
     db = AuditDatabase()
     fetcher = DataFetcher(cfg)
@@ -486,7 +487,7 @@ def main() -> int:
     spot = fetcher.fetch_spot()
     if spot == 0.0: spot = float(df_h1['close'].iloc[-1])
 
-    levels = calculate_dynamic_risk_levels(ensemble.action, spot, ensemble.atr_value)
+    levels = calculate_dynamic_risk_levels(ensemble.action, spot, ensemble.atr_value, ensemble.atr_multiplier)
     db.record_signal(ensemble, spot, levels)
     sent = send_telegram(ensemble, spot, levels)
 
