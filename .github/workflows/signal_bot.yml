@@ -1,11 +1,8 @@
 name: XAUUSD Quant Bot Elite v3.7
 
 on:
-  # Berjalan otomatis setiap 1 jam pada hari kerja (Senin - Jumat)
   schedule:
     - cron: '0 * * * 1-5'
-  
-  # Memungkinkan Anda menjalankan bot secara manual dari tab Actions di GitHub
   workflow_dispatch:
 
 jobs:
@@ -13,24 +10,20 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      # 1. Checkout repositori kode Anda
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. Setup Python versi 3.11 (sesuai standar environment)
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # 3. Install Dependensi yang diperlukan (termasuk requests, pandas, numpy, pyyaml, python-dotenv)
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests pandas numpy pyyaml python-dotenv
 
-      # 4. Jalankan Bot Kuantitatif v3.7
       - name: Execute XAUUSD Quant Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -39,10 +32,3 @@ jobs:
           OHLCV_CSV_PATH: 'data/xauusd_h1.csv'
         run: |
           python xauusd_bot.py
-
-      # 5. Commit & Simpan Perubahan Audit Database otomatis (Opsional)
-      - name: Commit Audit DB Logs
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "Auto-update quant audit logs [skip ci]"
-          file_pattern: "data/quant_audit.db"
