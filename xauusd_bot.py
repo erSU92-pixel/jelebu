@@ -1,7 +1,8 @@
 """
-XAUUSD Quantitative Institutional Signal Bot (Master Quant Grade v3.9 - Multi-Feed & Dynamic Master)
+XAUUSD Quantitative Institutional Signal Bot (Master Quant Grade v4.0 - Macro-Driven Master)
 Architecture:
   - Multi-Feed Data Aggregator (TwelveData -> Yahoo Finance yfinance -> Local CSV Fallback)
+  - Macro Correlation Filter (DXY US Dollar Index & US 10Y Treasury Yield Inverse Veto Guard)
   - Dynamic Session Profiles (Asia Mean Reversion Mode vs London/NY Sniper Trend Mode)
   - Volatility Regime Switch (ATR & ADX Adaptive Volatility Tuning)
   - Multi-Timeframe Volume Confirmation (H1 Macro + M15 Micro Volume Spike Guard)
@@ -156,12 +157,11 @@ def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
 
 
 # ============================================================================
-# 3. ADVANCED DYNAMIC PROFILES & GUARDS
+# 3. ADVANCED MACRO CORRELATION & SESSION PROFILES
 # ============================================================================
 def get_dynamic_session_profile() -> Tuple[str, bool, float, float]:
     """
-    Mengembalikan profil parameter dinamis berdasarkan sesi pasar UTC:
-    Format: (nama_sesi, diizinkan_trading, min_threshold, atr_multiplier)
+    Profil parameter dinamis berdasarkan sesi pasar UTC:
     - Sesi Asia (00:00 - 08:00 UTC): Mode Mean Reversion / Range (Threshold 75%, ATR 1.0)
     - Sesi London & NY (08:00 - 21:00 UTC): Mode Trend Sniper (Threshold 85%, ATR 1.5)
     """
@@ -178,6 +178,40 @@ def get_dynamic_session_profile() -> Tuple[str, bool, float, float]:
         return "LONDON_NY_SNIPER_MODE", True, 85.0, 1.5
     else:
         return "OFF_HOURS", False, 99.0, 1.0
+
+
+def check_macro_correlation_filter() -> Tuple[bool, str]:
+    """
+    Mengambil data DXY (USD Index) dan US 10Y Yield via yfinance secara real-time.
+    Memeriksa apakah ada lonjakan penguatan ekstrem yang berlawanan arah dengan Emas (XAUUSD).
+    """
+    try:
+        # Tarik data harian terbaru DXY dan US 10Y Yield (^TNX)
+        dxy_df = yf.Ticker("DX-Y.NYB").history(period="5d")
+        yield_df = yf.Ticker("^TNX").history(period="5d")
+        
+        macro_notes = []
+        is_safe = True
+
+        if not dxy_df.empty and len(dxy_df) >= 2:
+            dxy_change = ((dxy_df['Close'].iloc[-1] - dxy_df['Close'].iloc[-2]) / dxy_df['Close'].iloc[-2]) * 100.0
+            if dxy_change > 0.4:  # DXY menguat tajam (> +0.4%)
+                is_safe = False
+                macro_notes.append(f"DXY surging (+{dxy_change:.2f}%)")
+
+        if not yield_df.empty and len(yield_df) >= 2:
+            yield_change = ((yield_df['Close'].iloc[-1] - yield_df['Close'].iloc[-2]) / yield_df['Close'].iloc[-2]) * 100.0
+            if yield_change > 0.5:  # Yield US 10Y melonjak tajam (> +0.5%)
+                is_safe = False
+                macro_notes.append(f"US 10Y Yield spiking (+{yield_change:.2f}%)")
+
+        if not is_safe:
+            return False, f"Macro Veto: USD/Yield Surge Detected ({', '.join(macro_notes)})"
+            
+        return True, "Macro Correlation Normal"
+    except Exception as e:
+        # Jika gagal menarik data makro luar, biarkan sistem tetap berjalan aman
+        return True, f"Macro Check Bypass (Error: {str(e)[:30]})"
 
 
 def check_macro_news_guard() -> Tuple[bool, str]:
@@ -222,14 +256,12 @@ class DataFetcher:
         return df
 
     def fetch_yfinance_feed(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Tier 2: Yahoo Finance Feed (100% Free, No API Key Required)"""
-        ticker = yf.Ticker("GC=F") # Gold Futures proxy
+        ticker = yf.Ticker("GC=F")
         df_h1 = ticker.history(period="60d", interval="1h")
         if df_h1.empty:
             raise RuntimeError("Yahoo Finance H1 empty data")
         
         df_h1 = df_h1.reset_index()
-        # Handle column naming variations across yfinance versions
         time_col = "Datetime" if "Datetime" in df_h1.columns else ("Date" if "Date" in df_h1.columns else df_h1.columns[0])
         df_h1 = df_h1.rename(columns={time_col: "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
         df_h1["time"] = pd.to_datetime(df_h1["time"])
@@ -244,7 +276,6 @@ class DataFetcher:
         return df_h1, df_m15
 
     def fetch_csv_fallback(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Tier 3: Local CSV Offline Backup"""
         csv_path = os.getenv("OHLCV_CSV_PATH", "data/xauusd_h1.csv")
         if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
             df_h1 = pd.read_csv(csv_path)
@@ -259,8 +290,6 @@ class DataFetcher:
         raise RuntimeError("Local CSV fallback tidak ditemukan.")
 
     def fetch_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Cascading Multi-Feed Pipeline: TwelveData -> Yahoo Finance -> Local CSV"""
-        # Tier 1: TwelveData API
         try:
             df_h1 = self.fetch_twelvedata("1h", 300)
             df_m15 = self.fetch_twelvedata("15min", 200)
@@ -272,7 +301,6 @@ class DataFetcher:
         except Exception as e:
             log_event(LOGGER, "twelvedata_failover", error=str(e), action="Falling back to Yahoo Finance")
 
-        # Tier 2: Yahoo Finance Feed
         try:
             df_h1, df_m15 = self.fetch_yfinance_feed()
             if len(df_h1) >= self.cfg.min_bars:
@@ -281,7 +309,6 @@ class DataFetcher:
         except Exception as e:
             log_event(LOGGER, "yfinance_failover", error=str(e), action="Falling back to Local CSV")
 
-        # Tier 3: Local CSV Fallback
         log_event(LOGGER, "data_source_tier3", status="Success Local CSV Backup")
         return self.fetch_csv_fallback()
 
@@ -364,9 +391,10 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Any
     regime = "trending" if adx_s.iloc[-1] > 20 else "ranging"
     poc = volume_profile_poc(df_h1)
 
-    # Dynamic Session Profile & Thresholds
+    # Dynamic Session Profile, Macro Correlation & Guards
     session_name, session_ok, min_threshold, atr_multiplier = get_dynamic_session_profile()
     news_ok, news_msg = check_macro_news_guard()
+    macro_corr_ok, macro_corr_msg = check_macro_correlation_filter()
 
     # Pillar 4: Macro Trend Filter (EMA 200 H1)
     ema200 = ema(close, 200).iloc[-1]
@@ -385,7 +413,6 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Any
     if hi > prev['high'].max() and cl < prev['high'].max(): sweep = "BEARISH_SWEEP"
     elif lo < prev['low'].min() and cl > prev['low'].min(): sweep = "BULLISH_SWEEP"
 
-    # Multi-Timeframe Volume Spike Confirmation (H1 & M15)
     h1_vol_ratio = last['volume'] / (df_h1['volume'].iloc[-21:-1].mean() + 1e-10)
     m15_vol_ratio = df_m15['volume'].iloc[-1] / (df_m15['volume'].iloc[-20:].mean() + 1e-10)
 
@@ -411,11 +438,13 @@ def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Any
     action = "WAIT"
     notes = []
 
-    # Evaluation with Dynamic Session Rules
+    # Evaluation with Macro Correlation & Session Rules
     if not news_ok:
         notes.append(f"MACRO NEWS GUARD: {news_msg}.")
     elif not session_ok:
         notes.append(f"SESSION GUARD: Di luar jam operasional ({session_name}).")
+    elif not macro_corr_ok:
+        notes.append(f"MACRO CORRELATION VETO: {macro_corr_msg}.")
     elif combined_score < min_threshold:
         notes.append(f"GATED: Confluence {combined_score:.1f}% < {min_threshold}% ({session_name}).")
     elif not macro_passed:
@@ -470,10 +499,10 @@ def send_telegram(ensemble: EnsembleResult, spot: float, levels: Optional[Dict[s
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     if ensemble.action == "WAIT":
-        msg = f"🟡 <b>XAUUSD QUANT v3.9 (MULTI-FEED GUARD): WAIT</b>\n⏰ <code>{now}</code>\n<b>Score:</b> {ensemble.total_score}%\n<b>Reason:</b> {ensemble.notes[0]}"
+        msg = f"🟡 <b>XAUUSD QUANT v4.0 (MACRO GUARD): WAIT</b>\n⏰ <code>{now}</code>\n<b>Score:</b> {ensemble.total_score}%\n<b>Reason:</b> {ensemble.notes[0]}"
     else:
         emoji = "🟢" if ensemble.action == "BUY" else "🔴"
-        msg = f"""{emoji} <b>XAUUSD QUANT v3.9 ({ensemble.action} - MASTER QUANT)</b>
+        msg = f"""{emoji} <b>XAUUSD QUANT v4.0 ({ensemble.action} - MACRO MASTER)</b>
 ⏰ <code>{now}</code>
 ───────────────────
 <b>Confluence:</b> <b>{ensemble.total_score}%</b> | <b>Regime:</b> {ensemble.regime.upper()}
@@ -506,7 +535,7 @@ class SimpleConfig:
 
 
 def main() -> int:
-    log_event(LOGGER, "bot_started", version="3.9.0-multifeed-master")
+    log_event(LOGGER, "bot_started", version="4.0.0-macro-master")
     cfg = SimpleConfig()
     db = AuditDatabase()
     fetcher = DataFetcher(cfg)
