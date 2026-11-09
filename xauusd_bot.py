@@ -1,6 +1,7 @@
 """
-XAUUSD Quantitative Institutional Signal Bot (Master Quant Grade v3.8 - Dynamic Multi-Strategy & Smart Risk)
+XAUUSD Quantitative Institutional Signal Bot (Master Quant Grade v3.9 - Multi-Feed & Dynamic Master)
 Architecture:
+  - Multi-Feed Data Aggregator (TwelveData -> Yahoo Finance yfinance -> Local CSV Fallback)
   - Dynamic Session Profiles (Asia Mean Reversion Mode vs London/NY Sniper Trend Mode)
   - Volatility Regime Switch (ATR & ADX Adaptive Volatility Tuning)
   - Multi-Timeframe Volume Confirmation (H1 Macro + M15 Micro Volume Spike Guard)
@@ -28,6 +29,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
+import yfinance as yf
 
 load_dotenv()
 
@@ -186,7 +188,7 @@ def check_macro_news_guard() -> Tuple[bool, str]:
 
 
 # ============================================================================
-# 4. MULTI-SOURCE DATA FETCHER & FAILOVER PIPELINE
+# 4. MULTI-FEED CASCADING DATA FETCHER & FAILOVER PIPELINE
 # ============================================================================
 def create_retry_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
     session = requests.Session()
@@ -219,7 +221,30 @@ class DataFetcher:
         df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
         return df
 
+    def fetch_yfinance_feed(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Tier 2: Yahoo Finance Feed (100% Free, No API Key Required)"""
+        ticker = yf.Ticker("GC=F") # Gold Futures proxy
+        df_h1 = ticker.history(period="60d", interval="1h")
+        if df_h1.empty:
+            raise RuntimeError("Yahoo Finance H1 empty data")
+        
+        df_h1 = df_h1.reset_index()
+        # Handle column naming variations across yfinance versions
+        time_col = "Datetime" if "Datetime" in df_h1.columns else ("Date" if "Date" in df_h1.columns else df_h1.columns[0])
+        df_h1 = df_h1.rename(columns={time_col: "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
+        df_h1["time"] = pd.to_datetime(df_h1["time"])
+        if df_h1["time"].dt.tz is not None:
+            df_h1["time"] = df_h1["time"].dt.tz_convert(None)
+        
+        df_h1 = df_h1.sort_values("time", ascending=True).reset_index(drop=True)
+        for c in ["open", "high", "low", "close"]: df_h1[c] = df_h1[c].astype(float)
+        df_h1["volume"] = pd.to_numeric(df_h1["volume"], errors="coerce").fillna(1000.0)
+        
+        df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
+        return df_h1, df_m15
+
     def fetch_csv_fallback(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Tier 3: Local CSV Offline Backup"""
         csv_path = os.getenv("OHLCV_CSV_PATH", "data/xauusd_h1.csv")
         if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
             df_h1 = pd.read_csv(csv_path)
@@ -234,21 +259,31 @@ class DataFetcher:
         raise RuntimeError("Local CSV fallback tidak ditemukan.")
 
     def fetch_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Cascading Multi-Feed Pipeline: TwelveData -> Yahoo Finance -> Local CSV"""
+        # Tier 1: TwelveData API
         try:
             df_h1 = self.fetch_twelvedata("1h", 300)
             df_m15 = self.fetch_twelvedata("15min", 200)
-            log_event(LOGGER, "data_source_primary", status="Success TwelveData API")
+            if df_h1 is not None and len(df_h1) >= self.cfg.min_bars:
+                if df_m15 is None:
+                    df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
+                log_event(LOGGER, "data_source_primary", status="Success TwelveData API")
+                return df_h1, df_m15
         except Exception as e:
-            log_event(LOGGER, "failover_triggered", error=str(e), action="Switching to Local CSV")
-            return self.fetch_csv_fallback()
+            log_event(LOGGER, "twelvedata_failover", error=str(e), action="Falling back to Yahoo Finance")
 
-        if df_h1 is None or len(df_h1) < self.cfg.min_bars:
-            return self.fetch_csv_fallback()
+        # Tier 2: Yahoo Finance Feed
+        try:
+            df_h1, df_m15 = self.fetch_yfinance_feed()
+            if len(df_h1) >= self.cfg.min_bars:
+                log_event(LOGGER, "data_source_secondary", status="Success Yahoo Finance Feed (yfinance)")
+                return df_h1, df_m15
+        except Exception as e:
+            log_event(LOGGER, "yfinance_failover", error=str(e), action="Falling back to Local CSV")
 
-        if df_m15 is None:
-            df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
-
-        return df_h1, df_m15
+        # Tier 3: Local CSV Fallback
+        log_event(LOGGER, "data_source_tier3", status="Success Local CSV Backup")
+        return self.fetch_csv_fallback()
 
     def fetch_spot(self) -> float:
         try:
@@ -415,7 +450,7 @@ def calculate_dynamic_risk_levels(signal: str, entry_price: float, atr_value: fl
         sl_price = entry_price - sl_dist
         tp1_price = entry_price + (sl_dist * 1.5)
         tp2_price = entry_price + (sl_dist * 2.5)
-        be_price = entry_price + (sl_dist * 0.8) # Break-even trigger target
+        be_price = entry_price + (sl_dist * 0.8)
     else:
         sl_price = entry_price + sl_dist
         tp1_price = entry_price - (sl_dist * 1.5)
@@ -435,10 +470,10 @@ def send_telegram(ensemble: EnsembleResult, spot: float, levels: Optional[Dict[s
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     if ensemble.action == "WAIT":
-        msg = f"🟡 <b>XAUUSD QUANT v3.8 (DYNAMIC GUARD): WAIT</b>\n⏰ <code>{now}</code>\n<b>Score:</b> {ensemble.total_score}%\n<b>Reason:</b> {ensemble.notes[0]}"
+        msg = f"🟡 <b>XAUUSD QUANT v3.9 (MULTI-FEED GUARD): WAIT</b>\n⏰ <code>{now}</code>\n<b>Score:</b> {ensemble.total_score}%\n<b>Reason:</b> {ensemble.notes[0]}"
     else:
         emoji = "🟢" if ensemble.action == "BUY" else "🔴"
-        msg = f"""{emoji} <b>XAUUSD QUANT v3.8 ({ensemble.action} - MASTER QUANT)</b>
+        msg = f"""{emoji} <b>XAUUSD QUANT v3.9 ({ensemble.action} - MASTER QUANT)</b>
 ⏰ <code>{now}</code>
 ───────────────────
 <b>Confluence:</b> <b>{ensemble.total_score}%</b> | <b>Regime:</b> {ensemble.regime.upper()}
@@ -471,7 +506,7 @@ class SimpleConfig:
 
 
 def main() -> int:
-    log_event(LOGGER, "bot_started", version="3.8.0-dynamic-master")
+    log_event(LOGGER, "bot_started", version="3.9.0-multifeed-master")
     cfg = SimpleConfig()
     db = AuditDatabase()
     fetcher = DataFetcher(cfg)
