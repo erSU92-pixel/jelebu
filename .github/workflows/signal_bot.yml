@@ -22,7 +22,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy pyyaml python-dotenv yfinance
+          pip install -r requirements.txt
 
       - name: Execute XAUUSD Quant Bot
         env:
