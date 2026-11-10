@@ -1,34 +1,50 @@
-name: XAUUSD Quant Bot Elite v3.9
+name: XAUUSD Quant Master v5.0 Auto-Run
 
 on:
+  # Menjalankan bot secara otomatis setiap 15 menit pada hari aktif pasar (Senin - Jumat)
   schedule:
-    - cron: '0 * * * 1-5'
+    - cron: '*/15 * * * 1-5'
+  
+  # Memungkinkan Anda menjalankan bot secara manual (klik tombol Run workflow) dari tab Actions di GitHub
   workflow_dispatch:
 
 jobs:
   run-quant-bot:
     runs-on: ubuntu-latest
-    
+
     steps:
+      # 1. Mengambil kode dari repository Anda
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # 2. Menyiapkan lingkungan Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
           cache: 'pip'
 
+      # 3. Menginstal pustaka / dependencies yang dibutuhkan bot
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests pandas numpy yfinance PyYAML python-dotenv
 
-      - name: Execute XAUUSD Quant Bot
+      # 4. Menjalankan skrip utama bot Python
+      - name: Run XAUUSD Quant Bot Script
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
-          OHLCV_CSV_PATH: 'data/xauusd_h1.csv'
         run: |
-          python xauusd_bot.py
+          python xauusd_quant_bot.py
+
+      # 5. Menyimpan kembali file database audit SQLite (opsional, jika ingin log tersimpan di repo)
+      - name: Commit and Push Audit Logs (Optional)
+        continue-on-error: true
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/quant_audit.db
+          git commit -m "chore: update quant audit database [skip ci]" || echo "No changes to commit"
+          git push
