@@ -52,22 +52,7 @@ def init_audit_db(db_path: str = "data/quant_audit.db") -> None:
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS signal_audit (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
-            decision TEXT,
-            confidence REAL,
-            ema200 REAL,
-            poc REAL,
-            atr REAL,
-            has_mss INTEGER,
-            mss_type TEXT,
-            fvg_bull REAL,
-            fvg_bear REAL,
-            voters_payload TEXT
-        )
-    """)
+    cursor.execute("CREATE TABLE IF NOT EXISTS signal_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP, decision TEXT, confidence REAL, ema200 REAL, poc REAL, atr REAL, has_mss INTEGER, mss_type TEXT, fvg_bull REAL, fvg_bear REAL, voters_payload TEXT)")
     conn.commit()
     conn.close()
 
@@ -333,16 +318,11 @@ class EnsembleEngine:
             "metrics": {"ema200": round(last_ema200, 2), "poc": round(poc, 2), "atr": round(last_atr, 2)}
         }
 
-    def _log_to_audit_db(self, decision: str, confidence: float, ema200: float, poc: float, atr_val: float,
-                        has_mss: int, mss_type: str, fvg_bull: float, fvg_bear: float, voters_json: str) -> None:
+    def _log_to_audit_db(self, decision: str, confidence: float, ema200: float, poc: float, atr_val: float, has_mss: int, mss_type: str, fvg_bull: float, fvg_bear: float, voters_json: str) -> None:
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO signal_audit (
-                    decision, confidence, ema200, poc, atr, has_mss, mss_type, fvg_bull, fvg_bear, voters_payload
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (decision, confidence, ema200, poc, atr_val, has_mss, mss_type, fvg_bull, fvg_bear, voters_json))
+            cursor.execute("INSERT INTO signal_audit (decision, confidence, ema200, poc, atr, has_mss, mss_type, fvg_bull, fvg_bear, voters_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (decision, confidence, ema200, poc, atr_val, has_mss, mss_type, fvg_bull, fvg_bear, voters_json))
             conn.commit()
             conn.close()
         except Exception as e:
@@ -461,17 +441,14 @@ if __name__ == "__main__":
     engine = EnsembleEngine(config.db_path)
 
     try:
-        # 1. Pipeline pengambilan data
         df_h1, df_m15 = fetcher.fetch_data()
-        
-        # 2. Perhitungan & Analisis Keputusan Ensemble
         results = engine.generate_master_ensemble(df_h1, df_m15)
         print("\n=== PRO-GRADE XAUUSD BOT ENSEMBLE DECISION v5.1 ===")
         print(json.dumps(results, indent=2))
-        
-        # 3. Tampilkan Visualisasi Diagnostik Interaktif
-        print("\n=== GENERATING INTERACTIVE DIAGNOSTIC CHART ===")
-        visualize_market_signals(df_h1)
-        
+
+        if sys.stdout.isatty() or "ipykernel" in sys.modules:
+            print("\n=== GENERATING INTERACTIVE DIAGNOSTIC CHART ===")
+            visualize_market_signals(df_h1)
+
     except Exception as e:
         logger.critical("system_crash", extra={"error": str(e)})
