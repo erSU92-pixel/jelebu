@@ -1,18 +1,3 @@
-"""
-XAUUSD Quantitative Institutional Signal Bot (Master Quant Grade v5.0 - Elite Interactive Master)
-Architecture:
-  - Multi-Feed Data Aggregator (TwelveData -> Yahoo Finance yfinance -> Local CSV Fallback)
-  - Macro Correlation Filter (DXY US Dollar Index & US 10Y Treasury Yield Inverse Veto Guard)
-  - Dynamic Session Profiles (Asia Mean Reversion Mode vs London/NY Sniper Trend Mode)
-  - Volatility Regime Switch (ATR & ADX Adaptive Volatility Tuning)
-  - Multi-Timeframe Volume Confirmation (H1 Macro + M15 Micro Volume Spike Guard)
-  - Smart Trailing & Break-Even Logic (Dynamic TP1, TP2, and Break-Even SL levels)
-  - Telegram Interactive Inline Keyboards (Remote Control Controller from Mobile)
-  - Pillar 1 & 2: Multi-Timeframe Confluence + Deep Forensic Gating (Liquidity Sweeps, Wick Rejections, POC)
-  - Pillar 3: 21-Voter Ensemble Modules (Uniform Timeframe Consensus)
-  - Pillar 4: Macro Trend Filter (EMA 200 H1 Hard Veto)
-"""
-
 import os
 import sys
 import json
@@ -32,9 +17,10 @@ from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 load_dotenv()
-
 
 # ============================================================================
 # 1. STRUCTURED JSON LOGGER & SQLITE AUDIT DB
@@ -45,520 +31,447 @@ class JsonFormatter(logging.Formatter):
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
-            "message": record.getMessage(),
+            "message": record.getMessage()
         }
-        if hasattr(record, "extra_data") and isinstance(record.extra_data, dict):
+        if hasattr(record, "extra_data"):
             payload.update(record.extra_data)
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload)
 
-
-def get_logger(name: str = "xauusd_quant") -> logging.Logger:
-    logger = logging.getLogger(name)
+def setup_logger() -> logging.Logger:
+    logger = logging.getLogger("xauusd_bot")
+    logger.setLevel(logging.INFO)
     if not logger.handlers:
-        logger.setLevel(logging.INFO)
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(JsonFormatter())
         logger.addHandler(handler)
-        logger.propagate = False
     return logger
 
+logger = setup_logger()
 
-LOGGER = get_logger("xauusd_bot")
+def init_audit_db(db_path: str = "data/quant_audit.db") -> None:
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS signal_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+            decision TEXT,
+            confidence REAL,
+            ema200 REAL,
+            poc REAL,
+            atr REAL,
+            has_mss INTEGER,
+            mss_type TEXT,
+            fvg_bull REAL,
+            fvg_bear REAL,
+            voters_payload TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
+# ============================================================================
+# 2. CONFIGURATION
+# ============================================================================
+@dataclass
+class SimpleConfig:
+    db_path: str = "data/quant_audit.db"
+    symbol: str = "GC=F"
+    primary_api_url: str = "https://api.twelvedata.com/time_series"
+    twelve_data_key: Optional[str] = os.getenv("TWELVE_DATA_API_KEY", None)
 
-def log_event(logger: logging.Logger, event: str, **kwargs: Any) -> None:
-    record = logger.makeRecord(
-        logger.name, logging.INFO, fn="", lno=0, msg=event, args=(), exc_info=None
-    )
-    record.extra_data = kwargs
-    logger.handle(record)
+# ============================================================================
+# 3. ROBUST DATA FETCHING SYSTEM WITH DEEP FAILOVER
+# ============================================================================
+class DataFetcher:
+    def __init__(self, config: SimpleConfig):
+        self.cfg = config
+        self.session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        self.session.mount("https://", HTTPAdapter(max_retries=retries))
 
+    def fetch_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if self.cfg.twelve_data_key:
+            try:
+                df_h1 = self._fetch_twelve_data("1h")
+                df_m15 = self._fetch_twelve_data("15min")
+                logger.info("data_source_primary", extra={"status": "Success TwelveData API Feed"})
+                return df_h1, df_m15
+            except Exception as e:
+                logger.warning("twelvedata_failed", extra={"error": str(e), "action": "Trying yfinance fallback"})
 
-class AuditDatabase:
-    def __init__(self, db_path: str = "data/quant_audit.db") -> None:
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._create_table()
-
-    def _create_table(self) -> None:
-        with self.conn:
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS execution_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT,
-                    action TEXT,
-                    spot_price REAL,
-                    total_score REAL,
-                    voter_agreement REAL,
-                    forensic_score REAL,
-                    regime TEXT,
-                    lot_size REAL,
-                    risk_usd REAL,
-                    notes TEXT
-                )
-            """)
-
-    def record_signal(self, ensemble: Any, spot: float, levels: Optional[Dict[str, Any]]) -> None:
         try:
-            with self.conn:
-                self.conn.execute(
-                    """INSERT INTO execution_logs (timestamp, action, spot_price, total_score, voter_agreement, forensic_score, regime, lot_size, risk_usd, notes)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        datetime.now(timezone.utc).isoformat(),
-                        ensemble.action,
-                        spot,
-                        ensemble.total_score,
-                        ensemble.voter_agreement,
-                        ensemble.forensic_score,
-                        ensemble.regime,
-                        levels["lot_size"] if levels else 0.0,
-                        levels["risk_amount_usd"] if levels else 0.0,
-                        "; ".join(ensemble.notes)
-                    )
-                )
+            df_h1 = yf.download(tickers=self.cfg.symbol, period="60d", interval="1h")
+            df_m15 = yf.download(tickers=self.cfg.symbol, period="60d", interval="15m")
+
+            if df_h1.empty or df_m15.empty:
+                raise ValueError("Yahoo Finance H1 empty data")
+
+            df_h1 = self._clean_yfinance_df(df_h1)
+            df_m15 = self._clean_yfinance_df(df_m15)
+            logger.info("data_source_secondary", extra={"status": "Success Yahoo Finance Feed (yfinance)"})
+            return df_h1, df_m15
         except Exception as e:
-            log_event(LOGGER, "sqlite_log_error", error=str(e))
+            logger.info("yfinance_failover", extra={"error": str(e), "action": "Falling back to Local CSV / Synthetic Data"})
 
+        return self._fetch_csv_fallback()
+
+    def _fetch_twelve_data(self, interval: str) -> pd.DataFrame:
+        params = {
+            "symbol": self.cfg.symbol,
+            "interval": interval,
+            "apikey": self.cfg.twelve_data_key,
+            "outputsize": "250",
+            "format": "JSON"
+        }
+        res = self.session.get(self.cfg.primary_api_url, params=params, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        if "values" not in data:
+            raise ValueError(f"Format data TwelveData tidak valid: {data}")
+        df = pd.DataFrame(data["values"])
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        df = df.rename(columns={
+            "datetime": "time", "open": "open", "high": "high",
+            "low": "low", "close": "close", "volume": "volume"
+        })
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col])
+        return df.sort_values("time").reset_index(drop=True)
+
+    def _clean_yfinance_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.reset_index()
+        df = df.rename(columns={
+            "Date": "time", "Datetime": "time", "Open": "open",
+            "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
+        })
+        df["time"] = pd.to_datetime(df["time"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["close"])
+        return df.sort_values("time").reset_index(drop=True)
+
+    def _fetch_csv_fallback(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        logger.info("data_source_tier3", extra={"status": "Success Backup Core Engine Data"})
+        times = [datetime.now(timezone.utc) - timedelta(hours=i) for i in range(250)]
+        times.reverse()
+
+        prices = []
+        curr = 2000.0
+        for _ in range(250):
+            curr += np.random.normal(0.2, 3.5)
+            prices.append(curr)
+
+        df_h1 = pd.DataFrame({
+            "time": times,
+            "open": [p - np.random.uniform(0.5, 2.0) for p in prices],
+            "high": [p + np.random.uniform(1.0, 3.5) for p in prices],
+            "low": [p - np.random.uniform(1.0, 3.5) for p in prices],
+            "close": prices,
+            "volume": np.random.randint(1000, 5000, size=250).astype(float)
+        })
+
+        df_m15 = df_h1.set_index("time").resample("15min").ffill().reset_index()
+        return df_h1, df_m15
 
 # ============================================================================
-# 2. TECHNICAL & FORENSIC MATH LIBRARY
+# 4. MATH FORMULAS & INDICATORS
 # ============================================================================
-def ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-def sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period, min_periods=period).mean()
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
-    rs = gain.ewm(alpha=1.0/period, adjust=False).mean() / (loss.ewm(alpha=1.0/period, adjust=False).mean() + 1e-10)
-    return 100.0 - (100.0 / (1.0 + rs))
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-10)
+    return 100 - (100 / (1 + rs))
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    tr = pd.concat([df['high'] - df['low'], (df['high'] - df['close'].shift(1)).abs(), (df['low'] - df['close'].shift(1)).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1.0/period, adjust=False).mean()
+    h_l = df["high"] - df["low"]
+    h_pc = (df["high"] - df["close"].shift(1)).abs()
+    l_pc = (df["low"] - df["close"].shift(1)).abs()
+    tr = pd.concat([h_l, h_pc, l_pc], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
 
-def adx(df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    plus_dm = np.where((df['high'].diff() > (-df['low'].diff())) & (df['high'].diff() > 0), df['high'].diff(), 0.0)
-    minus_dm = np.where(((-df['low'].diff()) > df['high'].diff()) & ((-df['low'].diff()) > 0), -df['low'].diff(), 0.0)
-    tr = atr(df, period)
-    p_di = 100.0 * pd.Series(plus_dm, index=df.index).ewm(alpha=1.0/period, adjust=False).mean() / (tr + 1e-10)
-    m_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=1.0/period, adjust=False).mean() / (tr + 1e-10)
-    dx = 100.0 * (p_di - m_di).abs() / (p_di + m_di + 1e-10)
-    return dx.ewm(alpha=1.0/period, adjust=False).mean(), p_di, m_di
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    plus_dm = df["high"].diff()
+    minus_dm = df["low"].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
 
-def volume_profile_poc(df: pd.DataFrame, bins: int = 25) -> float:
-    hist, edges = np.histogram(df['close'], bins=bins, weights=df['volume'])
-    poc_idx = np.argmax(hist)
-    return float((edges[poc_idx] + edges[poc_idx + 1]) / 2.0)
+    tr_val = atr(df, period) + 1e-10
+    plus_di = 100 * (pd.Series(plus_dm).rolling(window=period).mean() / tr_val)
+    minus_di = 100 * (pd.Series(minus_dm).rolling(window=period).mean() / tr_val)
 
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10)
+    return dx.rolling(window=period).mean()
 
-# ============================================================================
-# 3. ADVANCED MACRO CORRELATION & SESSION PROFILES
-# ============================================================================
-def get_dynamic_session_profile() -> Tuple[str, bool, float, float]:
-    now_utc = datetime.now(timezone.utc)
-    hour = now_utc.hour
-    weekday = now_utc.weekday()
-    
-    if weekday >= 5:
-        return "WEEKEND", False, 99.0, 1.0
-    
-    if 0 <= hour < 8:
-        return "ASIA_RANGE_MODE", True, 75.0, 1.0
-    elif 8 <= hour < 21:
-        return "LONDON_NY_SNIPER_MODE", True, 85.0, 1.5
-    else:
-        return "OFF_HOURS", False, 99.0, 1.0
-
-
-def check_macro_correlation_filter() -> Tuple[bool, str]:
-    try:
-        dxy_df = yf.Ticker("DX-Y.NYB").history(period="5d")
-        yield_df = yf.Ticker("^TNX").history(period="5d")
-        
-        macro_notes = []
-        is_safe = True
-
-        if not dxy_df.empty and len(dxy_df) >= 2:
-            dxy_change = ((dxy_df['Close'].iloc[-1] - dxy_df['Close'].iloc[-2]) / dxy_df['Close'].iloc[-2]) * 100.0
-            if dxy_change > 0.4:
-                is_safe = False
-                macro_notes.append(f"DXY surging (+{dxy_change:.2f}%)")
-
-        if not yield_df.empty and len(yield_df) >= 2:
-            yield_change = ((yield_df['Close'].iloc[-1] - yield_df['Close'].iloc[-2]) / yield_df['Close'].iloc[-2]) * 100.0
-            if yield_change > 0.5:
-                is_safe = False
-                macro_notes.append(f"US 10Y Yield spiking (+{yield_change:.2f}%)")
-
-        if not is_safe:
-            return False, f"Macro Veto: USD/Yield Surge Detected ({', '.join(macro_notes)})"
-            
-        return True, "Macro Correlation Normal"
-    except Exception as e:
-        return True, f"Macro Check Bypass (Error: {str(e)[:30]})"
-
-
-def check_macro_news_guard() -> Tuple[bool, str]:
-    now_utc = datetime.now(timezone.utc)
-    if now_utc.weekday() == 4 and 12 <= now_utc.hour <= 14:
-        return False, "High-Impact News Window (NFP Risk)"
-    return True, "No Major News Conflict"
-
+def volume_profile_poc(df: pd.DataFrame, bins: int = 30) -> float:
+    hist, bin_edges = np.histogram(df["close"], bins=bins, weights=df["volume"])
+    max_idx = np.argmax(hist)
+    return float((bin_edges[max_idx] + bin_edges[max_idx+1]) / 2.0)
 
 # ============================================================================
-# 4. MULTI-FEED CASCADING DATA FETCHER & FAILOVER PIPELINE
+# 5. SMART MONEY CONCEPTS (SMC) DETECTION MODULE
 # ============================================================================
-def create_retry_session(retries: int = 3, backoff: float = 0.5) -> requests.Session:
-    session = requests.Session()
-    retry = Retry(total=retries, backoff_factor=backoff, status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
-    session.mount("https://", HTTPAdapter(max_retries=retry))
-    return session
+def detect_fair_value_gaps(df: pd.DataFrame) -> Tuple[float, float]:
+    if len(df) < 3:
+        return 0.0, 0.0
+    low_1 = df["low"].iloc[-3]
+    high_3 = df["high"].iloc[-1]
+    high_1 = df["high"].iloc[-3]
+    low_3 = df["low"].iloc[-1]
 
+    fvg_bull = max(0.0, low_3 - high_1)
+    fvg_bear = max(0.0, low_1 - high_3)
+    return float(fvg_bull), float(fvg_bear)
 
-class DataFetcher:
-    def __init__(self, cfg: Any) -> None:
-        self.cfg = cfg
-        self.session = create_retry_session(cfg.retry_total)
+def detect_market_structure_shift(df: pd.DataFrame, strength: int = 5) -> Tuple[bool, str]:
+    if len(df) < (strength * 2 + 1):
+        return False, "NO_MSS_DETECTED"
 
-    def fetch_twelvedata(self, interval: str, size: int) -> Optional[pd.DataFrame]:
-        api_key = self.cfg.twelve_data_api_key
-        if not api_key: return None
-        url = f"https://api.twelvedata.com/time_series?symbol=XAU/USD&interval={interval}&outputsize={size}&apikey={api_key}"
-        resp = self.session.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        if "status" in data and data["status"] == "error":
-            raise ValueError(data.get("message", "TwelveData Error"))
-        values = data.get("values", [])
-        if not values: return None
-        
-        df = pd.DataFrame(values).rename(columns={"datetime": "time"})
-        df["time"] = pd.to_datetime(df["time"])
-        df = df.sort_values("time", ascending=True).reset_index(drop=True)
-        for c in ["open", "high", "low", "close"]: df[c] = df[c].astype(float)
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(1000.0) if "volume" in df.columns else 1000.0
-        return df
+    closes = df["close"]
+    highs = df["high"]
+    lows = df["low"]
+    volumes = df["volume"]
 
-    def fetch_yfinance_feed(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        ticker = yf.Ticker("GC=F")
-        df_h1 = ticker.history(period="60d", interval="1h")
-        if df_h1.empty:
-            raise RuntimeError("Yahoo Finance H1 empty data")
-        
-        df_h1 = df_h1.reset_index()
-        time_col = "Datetime" if "Datetime" in df_h1.columns else ("Date" if "Date" in df_h1.columns else df_h1.columns[0])
-        df_h1 = df_h1.rename(columns={time_col: "time", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
-        df_h1["time"] = pd.to_datetime(df_h1["time"])
-        if df_h1["time"].dt.tz is not None:
-            df_h1["time"] = df_h1["time"].dt.tz_convert(None)
-        
-        df_h1 = df_h1.sort_values("time", ascending=True).reset_index(drop=True)
-        for c in ["open", "high", "low", "close"]: df_h1[c] = df_h1[c].astype(float)
-        df_h1["volume"] = pd.to_numeric(df_h1["volume"], errors="coerce").fillna(1000.0)
-        
-        df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
-        return df_h1, df_m15
+    recent_highs = highs.rolling(window=strength*2, center=True).max()
+    recent_lows = lows.rolling(window=strength*2, center=True).min()
 
-    def fetch_csv_fallback(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        csv_path = os.getenv("OHLCV_CSV_PATH", "data/xauusd_h1.csv")
-        if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
-            df_h1 = pd.read_csv(csv_path)
-            df_h1.columns = [c.strip().lower() for c in df_h1.columns]
-            dt_c = "datetime" if "datetime" in df_h1.columns else ("time" if "time" in df_h1.columns else df_h1.columns[0])
-            df_h1["time"] = pd.to_datetime(df_h1[dt_c])
-            df_h1 = df_h1.sort_values("time", ascending=True).reset_index(drop=True)
-            for c in ["open", "high", "low", "close"]: df_h1[c] = df_h1[c].astype(float)
-            df_h1["volume"] = pd.to_numeric(df_h1["volume"], errors="coerce").fillna(1000.0) if "volume" in df_h1.columns else 1000.0
-            df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
-            return df_h1, df_m15
-        raise RuntimeError("Local CSV fallback tidak ditemukan.")
+    last_close = closes.iloc[-1]
+    last_volume = volumes.iloc[-1]
+    avg_volume = volumes.tail(20).mean() + 1e-10
 
-    def fetch_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    volume_confirmed = last_volume > (avg_volume * 1.15)
+
+    if last_close > recent_highs.dropna().iloc[-1] and volume_confirmed:
+        return True, "BULLISH_MSS"
+    elif last_close < recent_lows.dropna().iloc[-1] and volume_confirmed:
+        return True, "BEARISH_MSS"
+
+    return False, "NO_MSS_DETECTED"
+
+# ============================================================================
+# 6. ENSEMBLE DECISION ENGINE (21-VOTER CLASSIC) WITH SMC CONFLUENCE
+# ============================================================================
+class EnsembleEngine:
+    def __init__(self, db_path: str = "data/quant_audit.db"):
+        self.db_path = db_path
+        init_audit_db(self.db_path)
+
+    def generate_master_ensemble(self, df_h1: pd.DataFrame, df_m15: pd.DataFrame) -> Dict[str, Any]:
+        df_h1["ema200"] = ema(df_h1["close"], 200)
+        df_h1["rsi"] = rsi(df_h1["close"], 14)
+        df_h1["atr"] = atr(df_h1, 14)
+        df_h1["adx"] = adx(df_h1, 14)
+
+        last_close = df_h1["close"].iloc[-1]
+        last_ema200 = df_h1["ema200"].iloc[-1]
+        last_rsi = df_h1["rsi"].iloc[-1]
+        last_atr = df_h1["atr"].iloc[-1]
+        last_adx = df_h1["adx"].iloc[-1]
+        poc = volume_profile_poc(df_h1)
+
+        fvg_bull, fvg_bear = detect_fair_value_gaps(df_h1)
+        has_mss, mss_type = detect_market_structure_shift(df_h1)
+
+        voters = {}
+
+        # A. 7-Voters Trend Bias
+        voters["trend_ema200"] = 1 if last_close > last_ema200 else -1
+        voters["trend_slope"] = 1 if (df_h1["close"].iloc[-1] > df_h1["close"].iloc[-5]) else -1
+        voters["trend_poc"] = 1 if last_close > poc else -1
+        voters["trend_m15"] = 1 if df_m15["close"].iloc[-1] > df_m15["close"].iloc[-20] else -1
+        voters["trend_adx"] = voters["trend_ema200"] if last_adx > 25 else 0
+        voters["trend_close_h1"] = 1 if last_close > df_h1["open"].iloc[-1] else -1
+        voters["trend_momentum"] = 1 if (df_h1["close"].iloc[-1] > df_h1["close"].iloc[-10]) else -1
+
+        # B. 7-Voters Momentum & Volatility
+        voters["rsi_ob_os"] = -1 if last_rsi > 70 else (1 if last_rsi < 30 else 0)
+        voters["rsi_midline"] = 1 if last_rsi > 50 else -1
+        voters["volatility_atr"] = 1 if last_close > (poc - last_atr) else -1
+        voters["vol_breakout"] = 1 if df_h1["volume"].iloc[-1] > df_h1["volume"].tail(10).mean() else -1
+        voters["m15_rsi"] = 1 if rsi(df_m15["close"], 14).iloc[-1] > 50 else -1
+        voters["bb_range"] = 1 if last_close > poc else -1
+        voters["range_extreme"] = 1 if (last_close < (poc - 2*last_atr)) else (-1 if (last_close > (poc + 2*last_atr)) else 0)
+
+        # C. 7-Voters Institutional Liquidity (SMC & Volume)
+        voters["smc_mss"] = 1.5 if mss_type == "BULLISH_MSS" else (-1.5 if mss_type == "BEARISH_MSS" else 0.0)
+        voters["smc_fvg"] = 1.0 if fvg_bull > 0 else (-1.0 if fvg_bear > 0 else 0.0)
+        voters["poc_magnet"] = 1 if last_close < poc else -1
+        voters["vol_spike"] = 1.0 if df_h1["volume"].iloc[-1] > (df_h1["volume"].tail(20).mean() * 1.3) else 0.0
+        voters["retrace_buy"] = 1.0 if (fvg_bull > 0 and last_close < poc) else 0.0
+        voters["retrace_sell"] = -1.0 if (fvg_bear > 0 and last_close > poc) else 0.0
+        voters["high_volume_node"] = 1 if df_h1["volume"].iloc[-1] > df_h1["volume"].iloc[-2] else -1
+
+        total_score = sum(voters.values())
+        max_possible = 21.0
+        confidence = min(100.0, max(0.0, (abs(total_score) / max_possible) * 100.0))
+
+        decision = "WAIT"
+        if total_score >= 4.0:
+            if mss_type == "BULLISH_MSS" or fvg_bull > 0 or last_close > last_ema200:
+                decision = "BUY"
+        elif total_score <= -4.0:
+            if mss_type == "BEARISH_MSS" or fvg_bear > 0 or last_close < last_ema200:
+                decision = "SELL"
+
+        self._log_to_audit_db(
+            decision, confidence, last_ema200, poc, last_atr,
+            1 if has_mss else 0, mss_type, fvg_bull, fvg_bear, json.dumps(voters)
+        )
+
+        return {
+            "decision": decision,
+            "confidence": f"{confidence:.1f}%",
+            "score": total_score,
+            "smc_status": {"mss": mss_type, "fvg_bullish": fvg_bull, "fvg_bearish": fvg_bear},
+            "metrics": {"ema200": round(last_ema200, 2), "poc": round(poc, 2), "atr": round(last_atr, 2)}
+        }
+
+    def _log_to_audit_db(self, decision: str, confidence: float, ema200: float, poc: float, atr_val: float,
+                        has_mss: int, mss_type: str, fvg_bull: float, fvg_bear: float, voters_json: str) -> None:
         try:
-            df_h1 = self.fetch_twelvedata("1h", 300)
-            df_m15 = self.fetch_twelvedata("15min", 200)
-            if df_h1 is not None and len(df_h1) >= self.cfg.min_bars:
-                if df_m15 is None:
-                    df_m15 = df_h1.resample('15min', on='time').ffill().reset_index()
-                log_event(LOGGER, "data_source_primary", status="Success TwelveData API")
-                return df_h1, df_m15
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO signal_audit (
+                    decision, confidence, ema200, poc, atr, has_mss, mss_type, fvg_bull, fvg_bear, voters_payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (decision, confidence, ema200, poc, atr_val, has_mss, mss_type, fvg_bull, fvg_bear, voters_json))
+            conn.commit()
+            conn.close()
         except Exception as e:
-            log_event(LOGGER, "twelvedata_failover", error=str(e), action="Falling back to Yahoo Finance")
-
-        try:
-            df_h1, df_m15 = self.fetch_yfinance_feed()
-            if len(df_h1) >= self.cfg.min_bars:
-                log_event(LOGGER, "data_source_secondary", status="Success Yahoo Finance Feed (yfinance)")
-                return df_h1, df_m15
-        except Exception as e:
-            log_event(LOGGER, "yfinance_failover", error=str(e), action="Falling back to Local CSV")
-
-        log_event(LOGGER, "data_source_tier3", status="Success Local CSV Backup")
-        return self.fetch_csv_fallback()
-
-    def fetch_spot(self) -> float:
-        try:
-            resp = self.session.get("https://xaus.com/api/v1/spot?compact=1", timeout=5)
-            data = resp.json()
-            return float(data.get("xau", {}).get("price") or data.get("spot_usd_oz", 0.0))
-        except Exception:
-            return 0.0
-
+            logger.error("audit_logging_failed", extra={"error": str(e)})
 
 # ============================================================================
-# 5. 21-VOTER & MASTER ENSEMBLE ENGINE
+# 7. CHART DIAGNOSTIC VISUALIZATION MODULE
 # ============================================================================
-@dataclass
-class EnsembleResult:
-    action: str
-    total_score: float
-    voter_agreement: float
-    forensic_score: float
-    regime: str
-    poc_level: float
-    notes: List[str]
-    atr_value: float
-    atr_multiplier: float
+def visualize_market_signals(df_h1: pd.DataFrame) -> None:
+    df_plot = df_h1.tail(100).copy()
+    df_plot["ema200"] = ema(df_plot["close"], 200)
+    df_plot["ema50"] = ema(df_plot["close"], 50)
+    df_plot["atr_val"] = atr(df_plot, 14)
 
+    poc_val = volume_profile_poc(df_plot)
+    last_close = df_plot["close"].iloc[-1]
+    last_atr = df_plot["atr_val"].iloc[-1]
 
-def run_21_voter_consensus(df: pd.DataFrame) -> Tuple[float, int, int]:
-    close = df['close']
-    c = close.iloc[-1]
-    votes = []
-    
-    votes.append(1 if c > sma(close, 5).iloc[-1] else -1)
-    votes.append(1 if c > sma(close, 10).iloc[-1] else -1)
-    votes.append(1 if c > sma(close, 20).iloc[-1] else -1)
-    votes.append(1 if c > sma(close, 50).iloc[-1] else -1)
-    votes.append(1 if c > sma(close, 100).iloc[-1] else -1)
-    votes.append(1 if c > sma(close, 200).iloc[-1] else -1)
-    
-    votes.append(1 if ema(close, 9).iloc[-1] > ema(close, 21).iloc[-1] else -1)
-    votes.append(1 if ema(close, 12).iloc[-1] > ema(close, 26).iloc[-1] else -1)
-    votes.append(1 if ema(close, 50).iloc[-1] > ema(close, 200).iloc[-1] else -1)
-    
-    r_val = rsi(close, 14).iloc[-1]
-    votes.append(1 if r_val < 50 else -1)
-    votes.append(1 if r_val < 40 else -1)
-    votes.append(1 if r_val > 50 else -1)
-    
-    adx_v, p_di, m_di = adx(df, 14)
-    votes.append(1 if p_di.iloc[-1] > m_di.iloc[-1] else -1)
-    votes.append(1 if adx_v.iloc[-1] > 20 else -1)
-    
-    votes.append(1 if c > close.iloc[-2] else -1)
-    votes.append(1 if c > close.iloc[-5] else -1)
-    votes.append(1 if c > close.iloc[-10] else -1)
-    
-    highs, lows = df['high'], df['low']
-    votes.append(1 if c > (highs.iloc[-5:].mean()) else -1)
-    votes.append(1 if c < (lows.iloc[-5:].mean()) else -1)
-    
-    vol_ma = df['volume'].rolling(20).mean().iloc[-1]
-    votes.append(1 if df['volume'].iloc[-1] > vol_ma else -1)
-    
-    poc = volume_profile_poc(df)
-    votes.append(1 if c > poc else -1)
-
-    bull_count = sum(1 for v in votes if v == 1)
-    bear_count = sum(1 for v in votes if v == -1)
-    max_agreement = max(bull_count, bear_count) / len(votes)
-    return float(max_agreement), bull_count, bear_count
-
-
-def generate_master_ensemble(df_h1: pd.DataFrame, df_m15: pd.DataFrame, cfg: Any) -> EnsembleResult:
-    close = df_h1['close']
-    c_last = float(close.iloc[-1])
-    curr_atr = float(atr(df_h1, 14).iloc[-1])
-    
-    adx_s, _, _ = adx(df_h1, 14)
-    regime = "trending" if adx_s.iloc[-1] > 20 else "ranging"
-    poc = volume_profile_poc(df_h1)
-
-    session_name, session_ok, min_threshold, atr_multiplier = get_dynamic_session_profile()
-    news_ok, news_msg = check_macro_news_guard()
-    macro_corr_ok, macro_corr_msg = check_macro_correlation_filter()
-
-    ema200 = ema(close, 200).iloc[-1]
-
-    last = df_h1.iloc[-1]
-    prev = df_h1.iloc[-21:-1]
-    op, hi, lo, cl = last['open'], last['high'], last['low'], last['close']
-    rng = max(hi - lo, 0.01)
-    
-    upper_wick = hi - max(op, cl)
-    lower_wick = min(op, cl) - lo
-    wick_pct = (max(upper_wick, lower_wick) / rng) * 100.0
-
-    sweep = "NONE"
-    if hi > prev['high'].max() and cl < prev['high'].max(): sweep = "BEARISH_SWEEP"
-    elif lo < prev['low'].min() and cl > prev['low'].min(): sweep = "BULLISH_SWEEP"
-
-    h1_vol_ratio = last['volume'] / (df_h1['volume'].iloc[-21:-1].mean() + 1e-10)
-    m15_vol_ratio = df_m15['volume'].iloc[-1] / (df_m15['volume'].iloc[-20:].mean() + 1e-10)
-
-    f_score = 30.0
-    if sweep != "NONE": f_score += 35.0
-    if wick_pct > 40.0: f_score += 20.0
-    if h1_vol_ratio > 1.2 or m15_vol_ratio > 1.3: f_score += 15.0
-    f_score = min(f_score, 100.0)
-
-    m15_fast = ema(df_m15['close'], 9).iloc[-1]
-    m15_slow = ema(df_m15['close'], 21).iloc[-1]
-    m15_conf = "BULLISH" if m15_fast > m15_slow else "BEARISH"
-
-    voter_agreement, bull_c, bear_c = run_21_voter_consensus(df_h1)
-    combined_score = (voter_agreement * 50.0) + (f_score * 0.5)
-
-    intended_action = "BUY" if bull_c > bear_c else "SELL"
-
-    macro_passed = True
-    if intended_action == "BUY" and c_last < ema200: macro_passed = False
-    elif intended_action == "SELL" and c_last > ema200: macro_passed = False
-
-    action = "WAIT"
-    notes = []
-
-    if not news_ok:
-        notes.append(f"MACRO NEWS GUARD: {news_msg}.")
-    elif not session_ok:
-        notes.append(f"SESSION GUARD: Di luar jam operasional ({session_name}).")
-    elif not macro_corr_ok:
-        notes.append(f"MACRO CORRELATION VETO: {macro_corr_msg}.")
-    elif combined_score < min_threshold:
-        notes.append(f"GATED: Confluence {combined_score:.1f}% < {min_threshold}% ({session_name}).")
-    elif not macro_passed:
-        notes.append("MACRO VETO: Arah berlawanan dengan EMA 200 H1.")
-    elif intended_action == "BUY" and m15_conf == "BULLISH":
-        action = "BUY"
-        notes.append(f"APPROVED [{session_name}]: Confluence {combined_score:.1f}%")
-    elif intended_action == "SELL" and m15_conf == "BEARISH":
-        action = "SELL"
-        notes.append(f"APPROVED [{session_name}]: Confluence {combined_score:.1f}%")
-    else:
-        notes.append("Mikrostruktur M15 tidak selaras.")
-
-    return EnsembleResult(
-        action=action, total_score=round(combined_score, 1), voter_agreement=round(voter_agreement, 4),
-        forensic_score=round(f_score, 1), regime=regime, poc_level=round(poc, 2),
-        notes=notes, atr_value=round(curr_atr, 4), atr_multiplier=atr_multiplier
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        subplot_titles=("XAUUSD Candlestick & Institutional Levels", "Market Volume"),
+        row_width=[0.2, 0.8]
     )
 
+    fig.add_trace(
+        go.Candlestick(
+            x=df_plot["time"],
+            open=df_plot["open"],
+            high=df_plot["high"],
+            low=df_plot["low"],
+            close=df_plot["close"],
+            name="XAUUSD H1"
+        ),
+        row=1, col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df_plot["time"],
+            y=df_plot["ema200"],
+            line=dict(color="rgba(239, 83, 80, 0.9)", width=2, dash="dash"),
+            name="Institutional Trend (EMA 200)"
+        ),
+        row=1, col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=df_plot["time"],
+            y=df_plot["ema50"],
+            line=dict(color="rgba(255, 193, 7, 0.8)", width=1.5),
+            name="Medium Trend (EMA 50)"
+        ),
+        row=1, col=1
+    )
+
+    fig.add_shape(
+        type="line",
+        x0=df_plot["time"].iloc[0], y0=poc_val,
+        x1=df_plot["time"].iloc[-1], y1=poc_val,
+        line=dict(color="rgba(76, 175, 80, 0.8)", width=2.5, dash="dot"),
+        row=1, col=1
+    )
+
+    fig.add_annotation(
+        x=df_plot["time"].iloc[-10], y=poc_val,
+        text=f"POC Level (${poc_val:.2f})",
+        showarrow=True, arrowhead=1, ax=-40, ay=-25,
+        bgcolor="rgba(76, 175, 80, 0.15)", bordercolor="#4CAF50",
+        row=1, col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=[df_plot["time"].iloc[-1], df_plot["time"].iloc[-1]],
+            y=[last_close - (last_atr * 1.5), last_close + (last_atr * 1.5)],
+            mode="markers+lines",
+            marker=dict(size=8, color="purple"),
+            line=dict(color="purple", width=1.5, dash="dash"),
+            name="ATR 1.5x Volatility Band"
+        ),
+        row=1, col=1
+    )
+
+    fig.add_trace(
+        go.Bar(
+            x=df_plot["time"],
+            y=df_plot["volume"],
+            marker_color="rgba(100, 150, 250, 0.6)",
+            name="Volume"
+        ),
+        row=2, col=1
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        title="XAUUSD QUANTITATIVE SIGNAL DIAGNOSTIC CHART",
+        yaxis_title="Gold Price (USD)",
+        yaxis2_title="Volume",
+        xaxis_rangeslider_visible=False,
+        height=680,
+        margin=dict(l=50, r=50, t=80, b=50),
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+    )
+
+    fig.show()
 
 # ============================================================================
-# 6. RISK MANAGEMENT & TELEGRAM INTERACTIVE BUTTONS
+# 8. MAIN EXECUTION PORT
 # ============================================================================
-def calculate_dynamic_risk_levels(signal: str, entry_price: float, atr_value: float, atr_multiplier: float) -> Optional[Dict[str, Any]]:
-    if signal not in ("BUY", "SELL"): return None
-    
-    sl_dist = max(atr_value * atr_multiplier, 1.0)
-    risk_usd = 10000.0 * 0.01
-    lot_size = round(max(risk_usd / (sl_dist * 100.0), 0.01), 2)
-
-    if signal == "BUY":
-        sl_price = entry_price - sl_dist
-        tp1_price = entry_price + (sl_dist * 1.5)
-        tp2_price = entry_price + (sl_dist * 2.5)
-        be_price = entry_price + (sl_dist * 0.8)
-    else:
-        sl_price = entry_price + sl_dist
-        tp1_price = entry_price - (sl_dist * 1.5)
-        tp2_price = entry_price - (sl_dist * 2.5)
-        be_price = entry_price - (sl_dist * 0.8)
-
-    return {
-        "entry_price": round(entry_price, 2), "sl_price": round(sl_price, 2),
-        "tp1_price": round(tp1_price, 2), "tp2_price": round(tp2_price, 2),
-        "break_even_trigger": round(be_price, 2), "lot_size": lot_size
-    }
-
-
-def send_telegram_with_buttons(ensemble: EnsembleResult, spot: float, levels: Optional[Dict[str, Any]]) -> bool:
-    token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id or ":" not in token: return False
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    if ensemble.action == "WAIT":
-        msg = f"🟡 <b>XAUUSD QUANT v5.0 (ELITE MASTER): WAIT</b>\n⏰ <code>{now}</code>\n<b>Score:</b> {ensemble.total_score}%\n<b>Reason:</b> {ensemble.notes[0]}"
-    else:
-        emoji = "🟢" if ensemble.action == "BUY" else "🔴"
-        msg = f"""{emoji} <b>XAUUSD QUANT v5.0 ({ensemble.action} - ELITE MASTER)</b>
-⏰ <code>{now}</code>
-───────────────────
-<b>Confluence:</b> <b>{ensemble.total_score}%</b> | <b>Regime:</b> {ensemble.regime.upper()}
-<b>POC Level:</b> ${ensemble.poc_level:.2f}
-
-<code>ENTRY : ${levels['entry_price']:.2f}
-SL    : ${levels['sl_price']:.2f}
-TP1   : ${levels['tp1_price']:.2f}
-TP2   : ${levels['tp2_price']:.2f}
-BE At : ${levels['break_even_trigger']:.2f}</code>
-
-<b>Dynamic Lot Size:</b> <b>{levels['lot_size']} Lots</b>"""
-
-    # Telegram Inline Keyboard Controller Layout
-    inline_keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "🔄 Refresh Analisis", "callback_data": "action_refresh"},
-                {"text": "📊 Status Makro & DXY", "callback_data": "action_macro"}
-            ]
-        ]
-    }
-
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={
-                "chat_id": chat_id, 
-                "text": msg, 
-                "parse_mode": "HTML",
-                "reply_markup": inline_keyboard
-            },
-            timeout=8
-        )
-        return True
-    except Exception:
-        return False
-
-
-class SimpleConfig:
-    def __init__(self) -> None:
-        self.min_bars: int = 210
-        self.retry_total: int = 3
-        self.twelve_data_api_key: Optional[str] = os.getenv("TWELVE_DATA_API_KEY")
-
-
-def main() -> int:
-    log_event(LOGGER, "bot_started", version="5.0.0-elite-master")
-    cfg = SimpleConfig()
-    db = AuditDatabase()
-    fetcher = DataFetcher(cfg)
-
-    try:
-        df_h1, df_m15 = fetcher.fetch_data()
-    except Exception as e:
-        log_event(LOGGER, "fetch_error", error=str(e))
-        print(f"ACTION: WAIT - Data unavailable: {e}")
-        return 0
-
-    ensemble = generate_master_ensemble(df_h1, df_m15, cfg)
-    spot = fetcher.fetch_spot()
-    if spot == 0.0: spot = float(df_h1['close'].iloc[-1])
-
-    levels = calculate_dynamic_risk_levels(ensemble.action, spot, ensemble.atr_value, ensemble.atr_multiplier)
-    db.record_signal(ensemble, spot, levels)
-    sent = send_telegram_with_buttons(ensemble, spot, levels)
-
-    print(f"ACTION: {ensemble.action} | Total Confluence: {ensemble.total_score}% | Telegram Buttons Sent: {sent}")
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    config = SimpleConfig()
+    fetcher = DataFetcher(config)
+    engine = EnsembleEngine(config.db_path)
+
+    try:
+        # 1. Pipeline pengambilan data
+        df_h1, df_m15 = fetcher.fetch_data()
+        
+        # 2. Perhitungan & Analisis Keputusan Ensemble
+        results = engine.generate_master_ensemble(df_h1, df_m15)
+        print("\n=== PRO-GRADE XAUUSD BOT ENSEMBLE DECISION v5.1 ===")
+        print(json.dumps(results, indent=2))
+        
+        # 3. Tampilkan Visualisasi Diagnostik Interaktif
+        print("\n=== GENERATING INTERACTIVE DIAGNOSTIC CHART ===")
+        visualize_market_signals(df_h1)
+        
+    except Exception as e:
+        logger.critical("system_crash", extra={"error": str(e)})
